@@ -1,11 +1,5 @@
 const alloc = @import("arch/allocation.zig");
 
-pub const BootstrapState = struct {
-    instruction_pointer: u64,
-    stack_pointer: u64,
-    translation_root: u64,
-};
-
 pub const Memory = struct {
     host_physical_start: u64,
     page_count: usize,
@@ -27,7 +21,6 @@ pub const Memory = struct {
 
 pub const Instance = struct {
     memory: Memory,
-    bootstrap: BootstrapState,
 };
 
 pub const SecondStageFault = struct {

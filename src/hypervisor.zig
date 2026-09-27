@@ -141,22 +141,16 @@ pub fn enter(logger: Logger, handoff_data: UefiHandoff) noreturn {
     const translation_root = Architecture.initializeGuestAddressSpace(guest_memory);
     kernel_logger.log("Guest pages tables configured.");
 
+    const instance = guest.Instance{ .memory = guest_memory };
+    const linux_boot_state = Architecture.prepareLinuxGuest(instance, translation_root);
+
     // TODO(garrett): We just apply an x64 HLT opcode here. If AArch64 takes off before we have
     // PVH, we'll need a comptime switch to handle that. Otherwise, we really want to
     // load the instructions from an actual boot target.
     const opcodes: [*]u8 = @ptrFromInt(guest_memory.host_physical_start);
     opcodes[0] = 0xF4;
 
-    const instance = guest.Instance{
-        .memory = guest_memory,
-        .bootstrap = guest.BootstrapState{
-            .instruction_pointer = 0x0000,
-            .stack_pointer = 0x2000,
-            .translation_root = translation_root,
-        },
-    };
-
-    cpu.prepareVirtualization(allocator, instance) catch |err| switch (err) {
+    cpu.prepareVirtualization(allocator, instance, linux_boot_state) catch |err| switch (err) {
         error.MemoryRequestFailed => {
             kernel_logger.log("Required memory could not be allocated.");
             Architecture.hlt();

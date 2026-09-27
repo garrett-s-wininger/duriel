@@ -2,6 +2,7 @@ const alloc = @import("../allocation.zig");
 const cpuid = @import("cpuid.zig");
 const gdt = @import("gdt.zig");
 const guest = @import("../../guest.zig");
+const guest_state = @import("guest_state.zig");
 const inst = @import("inst.zig");
 const paging = @import("paging.zig");
 const std = @import("std");
@@ -110,6 +111,10 @@ const VirtualMachineControlBlock = struct {
         return self.savedStatePtr(0x000, Segment);
     }
 
+    fn fs(self: Self) *Segment {
+        return self.savedStatePtr(0x040, Segment);
+    }
+
     fn exit_code(self: Self) *u64 {
         return self.ptr(0x070, u64);
     }
@@ -120,6 +125,10 @@ const VirtualMachineControlBlock = struct {
 
     fn exit_info2(self: Self) *u64 {
         return self.ptr(0x080, u64);
+    }
+
+    fn gs(self: Self) *Segment {
+        return self.savedStatePtr(0x050, Segment);
     }
 
     fn nested_cr3(self: Self) *u64 {
@@ -334,7 +343,21 @@ pub const Backend = struct {
         return pml4_start;
     }
 
-    pub fn prepareVirtualization(self: *Self, allocation_start_address: u64, instance: guest.Instance) void {
+    fn applySegment(source: guest_state.SegmentState, destination: *Segment) void {
+        destination.* = .{
+            .selector = @bitCast(source.selector),
+            .attribute = @bitCast(source.access_rights),
+            .limit = source.limit,
+            .base = source.base,
+        };
+    }
+
+    pub fn prepareVirtualization(
+        self: *Self,
+        allocation_start_address: u64,
+        instance: guest.Instance,
+        launch_state: guest_state.LaunchState,
+    ) void {
         const efer = inst.rdmsr(efer_msr);
         const svm_enabled_efer = efer | svm_enable_bit;
         inst.wrmsr(efer_msr, svm_enabled_efer);
@@ -348,9 +371,35 @@ pub const Backend = struct {
 
         const control_block: VirtualMachineControlBlock = .{ .raw = vm_control_block_address };
         control_block.fillFromCurrentCpu(svm_enabled_efer);
-        control_block.rip().* = instance.bootstrap.instruction_pointer;
-        control_block.rsp().* = instance.bootstrap.stack_pointer;
-        control_block.cr3().* = instance.bootstrap.translation_root;
+        control_block.efer().* = launch_state.efer | svm_enable_bit;
+        control_block.flags().* = @bitCast(launch_state.flags);
+
+        control_block.gdtr().* = .{
+            .selector = 0,
+            .attribute = 0,
+            .limit = launch_state.gdtr.limit,
+            .base = launch_state.gdtr.base,
+        };
+
+        control_block.idtr().* = .{
+            .selector = 0,
+            .attribute = 0,
+            .limit = launch_state.idtr.limit,
+            .base = launch_state.idtr.base,
+        };
+
+        control_block.rip().* = launch_state.instruction_pointer;
+        control_block.rsp().* = launch_state.stack_pointer;
+        control_block.cr0().* = launch_state.cr0;
+        control_block.cr3().* = launch_state.cr3;
+        control_block.cr4().* = launch_state.cr4;
+
+        applySegment(launch_state.cs, control_block.cs());
+        applySegment(launch_state.ds, control_block.ds());
+        applySegment(launch_state.es, control_block.es());
+        applySegment(launch_state.fs, control_block.fs());
+        applySegment(launch_state.gs, control_block.gs());
+        applySegment(launch_state.ss, control_block.ss());
 
         control_block.nested_cr3().* = prepareNestedPageTables(
             (allocation_start_address + (2 * alloc.page_size)),

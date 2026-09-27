@@ -3,8 +3,10 @@ const alloc = @import("allocation.zig");
 const cpuid = @import("x86_64/cpuid.zig");
 const gdt = @import("x86_64/gdt.zig");
 const guest = @import("../guest.zig");
+const guest_state = @import("x86_64/guest_state.zig");
 const idt = @import("x86_64/idt.zig");
 const inst = @import("x86_64/inst.zig");
+const linux = @import("x86_64/linux_boot.zig");
 const multitasking = @import("x86_64/multitasking.zig");
 const uart = @import("../peripherals/uart.zig");
 const paging = @import("x86_64/paging.zig");
@@ -25,6 +27,7 @@ pub const Error = error{
 };
 
 pub const FaultInfo = idt.FaultInfo;
+pub const GuestLaunchState = guest_state.LaunchState;
 
 pub const Backend = union(enum) {
     // TODO(garrett): Add Intel variant
@@ -32,7 +35,7 @@ pub const Backend = union(enum) {
 
     const Self = @This();
 
-    pub fn prepareVirtualization(self: *Self, allocator: alloc.PageAllocator, instance: guest.Instance) Error!void {
+    pub fn prepareVirtualization(self: *Self, allocator: alloc.PageAllocator, instance: guest.Instance, launch_state: GuestLaunchState) Error!void {
         return switch (self.*) {
             .amd => |*backend| {
                 if (!backend.isVirtualizationSupported()) return error.VirtualizationNotSupported;
@@ -45,7 +48,7 @@ pub const Backend = union(enum) {
                     return error.MemoryRequestFailed;
                 };
 
-                backend.prepareVirtualization(allocation_start_address, instance);
+                backend.prepareVirtualization(allocation_start_address, instance, launch_state);
             },
         };
     }
@@ -369,6 +372,10 @@ pub fn initializeInterrupts(handler: idt.FatalFaultHandler) void {
     };
 
     inst.loadInterruptDescriptorTable(&interrupt_descriptor_register);
+}
+
+pub fn prepareLinuxGuest(instance: guest.Instance, translation_root: u64) GuestLaunchState {
+    return linux.launchState(instance.memory, translation_root);
 }
 
 pub fn hlt() noreturn {

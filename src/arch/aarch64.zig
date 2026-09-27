@@ -24,7 +24,7 @@ pub const Backend = struct {
         return false;
     }
 
-    pub fn prepareVirtualization(_: *Self, _: alloc.PageAllocator, _: guest.Instance) Error!void {
+    pub fn prepareVirtualization(_: *Self, _: alloc.PageAllocator, _: guest.Instance, _: GuestLaunchState) Error!void {
         return error.NotImplemented;
     }
 
@@ -35,6 +35,7 @@ pub const Backend = struct {
 
 pub const FaultInfo = struct {};
 pub const FatalFaultHandler = *const fn (FaultInfo) noreturn;
+pub const GuestLaunchState = struct {};
 
 pub fn detect() Error!Backend {
     return error.NotImplemented;
@@ -54,6 +55,10 @@ pub fn initializeInterrupts(_: FatalFaultHandler) void {}
 
 pub fn nameForInterruptVector(_: u8) []const u8 {
     return "Unknown";
+}
+
+pub fn prepareLinuxGuest(_: guest.Instance, _: u64) GuestLaunchState {
+    return .{};
 }
 
 pub fn hlt() noreturn {
