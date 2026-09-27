@@ -1,0 +1,3 @@
+# Zig outputs
+.zig-cache/
+zig-out/

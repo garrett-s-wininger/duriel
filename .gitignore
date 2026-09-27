@@ -1,6 +1,2 @@
-# Zig outputs
-.zig-cache/
-zig-out/
-
 # Custom outputs
 dist/
