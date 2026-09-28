@@ -6,11 +6,13 @@ const guest = @import("../guest.zig");
 const guest_state = @import("x86_64/guest_state.zig");
 const idt = @import("x86_64/idt.zig");
 const inst = @import("x86_64/inst.zig");
-const linux = @import("x86_64/linux_boot.zig");
+const linux = @import("../linux.zig");
 const multitasking = @import("x86_64/multitasking.zig");
 const uart = @import("../peripherals/uart.zig");
 const paging = @import("x86_64/paging.zig");
+const raw = @import("x86_64/raw_boot.zig");
 const std = @import("std");
+const x64_linux = @import("x86_64/linux_boot.zig");
 const x64_uart = @import("x86_64/uart.zig");
 
 pub const ConsoleUart = uart.Ns16550(x64_uart.PortMapped);
@@ -19,8 +21,10 @@ pub const ConsoleUart = uart.Ns16550(x64_uart.PortMapped);
 pub const console_uart_base = x64_uart.com1;
 
 pub const Error = error{
+    InvalidGuestBootData,
     MemoryRequestFailed,
     NestedPagingNotSupported,
+    NotImplemented,
     UnknownVendor,
     VirtualizationDisabled,
     VirtualizationNotSupported,
@@ -28,6 +32,7 @@ pub const Error = error{
 
 pub const FaultInfo = idt.FaultInfo;
 pub const GuestLaunchState = guest_state.LaunchState;
+pub const GuestPreparation = guest.Preparation(GuestLaunchState);
 
 pub const Backend = union(enum) {
     // TODO(garrett): Add Intel variant
@@ -35,7 +40,7 @@ pub const Backend = union(enum) {
 
     const Self = @This();
 
-    pub fn prepareVirtualization(self: *Self, allocator: alloc.PageAllocator, instance: guest.Instance, launch_state: GuestLaunchState) Error!void {
+    pub fn prepareVirtualization(self: *Self, allocator: alloc.PageAllocator, prepared_guest: GuestPreparation) Error!void {
         return switch (self.*) {
             .amd => |*backend| {
                 if (!backend.isVirtualizationSupported()) return error.VirtualizationNotSupported;
@@ -48,7 +53,7 @@ pub const Backend = union(enum) {
                     return error.MemoryRequestFailed;
                 };
 
-                backend.prepareVirtualization(allocation_start_address, instance, launch_state);
+                backend.prepareVirtualization(allocation_start_address, prepared_guest.instance, prepared_guest.launch_state);
             },
         };
     }
@@ -305,7 +310,7 @@ pub fn initializeHostExecutionContext() Error!void {
 // TODO(garrett): We're configuring a 6-page memory layout for a halting virtual machine,
 // rather than a realistic one. As we get closer to PVH booting and more production
 // features, we'll need to be able to configure this better.
-pub fn initializeGuestAddressSpace(memory: guest.Memory) u64 {
+fn initializeGuestAddressSpace(memory: guest.Memory) u64 {
     const host_pml4_start = memory.host_physical_start + (2 * alloc.page_size);
     const host_page_directory_pointer_start = host_pml4_start + alloc.page_size;
     const host_page_directory_table_start = host_pml4_start + (2 * alloc.page_size);
@@ -374,8 +379,43 @@ pub fn initializeInterrupts(handler: idt.FatalFaultHandler) void {
     inst.loadInterruptDescriptorTable(&interrupt_descriptor_register);
 }
 
-pub fn prepareLinuxGuest(instance: guest.Instance, translation_root: u64) GuestLaunchState {
-    return linux.launchState(instance.memory, translation_root);
+pub fn prepareGuest(allocator: alloc.PageAllocator, boot_data: guest.BootData) Error!GuestPreparation {
+    return switch (boot_data) {
+        .raw => |raw_boot| prepareRawGuest(allocator, raw_boot),
+        .linux => |linux_boot| prepareLinuxGuest(allocator, linux_boot),
+    };
+}
+
+fn prepareRawGuest(allocator: alloc.PageAllocator, raw_boot: guest.RawBootData) Error!GuestPreparation {
+    // TODO(garrett): Support larger binary files.
+    if (raw_boot.bytes.len > alloc.page_size) {
+        return error.InvalidGuestBootData;
+    }
+
+    // NOTE(garrett): We register our guest with 1 code page, 1 stack page, and the
+    // 4-level page tables as the remainder for simplicity.
+    const memory = guest.Memory.init(allocator, 6) catch {
+        return error.MemoryRequestFailed;
+    };
+
+    const payload: [*]u8 = @ptrFromInt(memory.host_physical_start);
+    @memcpy(payload[0..raw_boot.bytes.len], raw_boot.bytes);
+
+    const translation_root = initializeGuestAddressSpace(memory);
+
+    return .{
+        .instance = .{ .memory = memory },
+        .launch_state = raw.launchState(memory, translation_root),
+    };
+}
+
+fn prepareLinuxGuest(_: alloc.PageAllocator, boot_data: linux.KernelBootData) Error!GuestPreparation {
+    const kernel = boot_data.kernel() catch return error.InvalidGuestBootData;
+
+    // TODO(garrett): Continue to flesh out
+    _ = x64_linux.parseHeader(kernel) catch return error.InvalidGuestBootData;
+
+    return error.NotImplemented;
 }
 
 pub fn hlt() noreturn {

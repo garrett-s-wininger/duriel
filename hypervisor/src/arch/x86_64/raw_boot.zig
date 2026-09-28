@@ -1,70 +1,8 @@
 const gdt = @import("gdt.zig");
 const guest = @import("../../guest.zig");
 const guest_state = @import("guest_state.zig");
-const linux = @import("../../linux.zig");
-const std = @import("std");
 
-pub const kernel_header_offset = 0x1f1;
-
-pub const KernelHeader = packed struct(u984) {
-    setup_sector_count: u8,
-    root_flags: u16,
-    code_size_32bit: u32,
-    ram_size: u16,
-    video_mode: u16,
-    root_device: u16,
-    boot_flag: u16,
-    jump: u16,
-    magic: u32,
-    boot_version: u16,
-    real_mode_switch: u32,
-    system_segment_start: u16,
-    kernel_version: u16,
-    bootloader_identifier: u8,
-    boot_protocol_flags: u8,
-    setup_move_size: u16,
-    code_start_32bit: u32,
-    ramdisk_load_address: u32,
-    ramdisk_size: u32,
-    bootsector_kludge: u32,
-    heap_end_pointer: u16,
-    extended_loader_version: u8,
-    extended_loader_type: u8,
-    command_line_pointer: u32,
-    initrd_max_address: u32,
-    kernel_alignment: u32,
-    is_kernel_relocatable: u8,
-    minimum_alignment: u8,
-    extended_boot_protocol_flags: u16,
-    command_line_size: u32,
-    hardware_subarchitecture: u32,
-    hardware_subarchitecture_data: u64,
-    kernel_payload_offset: u32,
-    kernel_payload_length: u32,
-    setup_data_pointer: u64,
-    preferred_loading_address: u64,
-    initialization_size: u32,
-    handover_offset: u32,
-    kernel_info_offset: u32,
-};
-
-comptime {
-    const header_bit_size = @bitSizeOf(KernelHeader);
-    if (header_bit_size != 984) @compileError("Linux kernel header must be 123 bytes (984 bits) in size.");
-}
-
-pub fn parseHeader(kernel: []const u8) linux.Error!KernelHeader {
-    const kernel_header_end = kernel_header_offset + @sizeOf(KernelHeader);
-    if (kernel.len < kernel_header_end) return error.OutOfBounds;
-
-    const header_pointer: *align(1) const KernelHeader = @ptrCast(kernel[kernel_header_offset..kernel_header_end].ptr);
-    return header_pointer.*;
-}
-
-pub const linux_x64_boot_gdt: [4]gdt.Entry = .{
-    gdt.Entry{
-        .segment_descriptor = gdt.SegmentDescriptor.nullEntry(),
-    },
+pub const raw_boot_gdt: [3]gdt.Entry = .{
     gdt.Entry{
         .segment_descriptor = gdt.SegmentDescriptor.nullEntry(),
     },
@@ -126,23 +64,23 @@ pub const linux_x64_boot_gdt: [4]gdt.Entry = .{
     },
 };
 
-pub fn launchState(memory: guest.Memory, translation_root: u64, _: linux.KernelBootData) guest_state.LaunchState {
+pub fn launchState(memory: guest.Memory, translation_root: u64) guest_state.LaunchState {
     const guest_pml4_address = translation_root;
-    const guest_gdt_address = guest_pml4_address - @sizeOf(@TypeOf(linux_x64_boot_gdt));
+    const guest_gdt_address = guest_pml4_address - @sizeOf(@TypeOf(raw_boot_gdt));
     const guest_gdt: [*]gdt.Entry = @ptrFromInt(memory.host_physical_start + guest_gdt_address);
 
-    @memcpy(guest_gdt[0..linux_x64_boot_gdt.len], linux_x64_boot_gdt[0..]);
+    @memcpy(guest_gdt[0..raw_boot_gdt.len], raw_boot_gdt[0..]);
 
     const code_selector = gdt.SegmentSelector{
         .privilege_level = 0,
         .table_selector = 0,
-        .table_index = 2,
+        .table_index = 1,
     };
 
     const data_selector = gdt.SegmentSelector{
         .privilege_level = 0,
         .table_selector = 0,
-        .table_index = 3,
+        .table_index = 2,
     };
 
     var guest_cr0: guest_state.ControlRegister0 = @bitCast(@as(u64, 0));
@@ -173,7 +111,7 @@ pub fn launchState(memory: guest.Memory, translation_root: u64, _: linux.KernelB
         .efer = @bitCast(guest_efer),
         .gdtr = .{
             .base = guest_gdt_address,
-            .limit = @sizeOf(@TypeOf(linux_x64_boot_gdt)) - 1,
+            .limit = @sizeOf(@TypeOf(raw_boot_gdt)) - 1,
         },
         .idtr = .{
             .base = 0,
@@ -181,15 +119,15 @@ pub fn launchState(memory: guest.Memory, translation_root: u64, _: linux.KernelB
         },
         .cs = guest_state.SegmentState.fromSelectorAndDescriptor(
             code_selector,
-            linux_x64_boot_gdt[2].segment_descriptor,
+            raw_boot_gdt[1].segment_descriptor,
         ),
         .ds = guest_state.SegmentState.fromSelectorAndDescriptor(
             data_selector,
-            linux_x64_boot_gdt[3].segment_descriptor,
+            raw_boot_gdt[2].segment_descriptor,
         ),
         .es = guest_state.SegmentState.fromSelectorAndDescriptor(
             data_selector,
-            linux_x64_boot_gdt[3].segment_descriptor,
+            raw_boot_gdt[2].segment_descriptor,
         ),
         .fs = .{
             .selector = .{
@@ -213,7 +151,7 @@ pub fn launchState(memory: guest.Memory, translation_root: u64, _: linux.KernelB
         },
         .ss = guest_state.SegmentState.fromSelectorAndDescriptor(
             data_selector,
-            linux_x64_boot_gdt[3].segment_descriptor,
+            raw_boot_gdt[2].segment_descriptor,
         ),
         .general_purpose_registers = .{
             .rax = 0,

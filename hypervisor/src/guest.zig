@@ -1,4 +1,14 @@
 const alloc = @import("arch/allocation.zig");
+const linux = @import("linux.zig");
+
+pub const RawBootData = struct {
+    bytes: []const u8,
+};
+
+pub const BootData = union(enum) {
+    raw: RawBootData,
+    linux: linux.KernelBootData,
+};
 
 pub const Memory = struct {
     host_physical_start: u64,
@@ -22,6 +32,13 @@ pub const Memory = struct {
 pub const Instance = struct {
     memory: Memory,
 };
+
+pub fn Preparation(comptime LaunchState: type) type {
+    return struct {
+        instance: Instance,
+        launch_state: LaunchState,
+    };
+}
 
 pub const SecondStageFault = struct {
     guest_physical_address: u64,

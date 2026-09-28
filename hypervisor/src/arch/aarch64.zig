@@ -1,5 +1,6 @@
 const alloc = @import("allocation.zig");
 const guest = @import("../guest.zig");
+const linux = @import("../linux.zig");
 const uart = @import("../peripherals/uart.zig");
 
 // TODO(garrett): Determine by parsing the device tree blob rather than blindly assuming
@@ -17,6 +18,9 @@ pub const Error = error{
     VirtualizationNotSupported,
 };
 
+pub const GuestLaunchState = struct {};
+pub const GuestPreparation = guest.Preparation(GuestLaunchState);
+
 pub const Backend = struct {
     const Self = @This();
 
@@ -24,7 +28,7 @@ pub const Backend = struct {
         return false;
     }
 
-    pub fn prepareVirtualization(_: *Self, _: alloc.PageAllocator, _: guest.Instance, _: GuestLaunchState) Error!void {
+    pub fn prepareVirtualization(_: *Self, _: alloc.PageAllocator, _: GuestPreparation) Error!void {
         return error.NotImplemented;
     }
 
@@ -35,7 +39,6 @@ pub const Backend = struct {
 
 pub const FaultInfo = struct {};
 pub const FatalFaultHandler = *const fn (FaultInfo) noreturn;
-pub const GuestLaunchState = struct {};
 
 pub fn detect() Error!Backend {
     return error.NotImplemented;
@@ -47,18 +50,14 @@ pub fn initializeHostExecutionContext() Error!void {
     return error.NotImplemented;
 }
 
-pub fn initializeGuestAddressSpace(_: guest.Memory) u64 {
-    return 0;
-}
-
 pub fn initializeInterrupts(_: FatalFaultHandler) void {}
 
 pub fn nameForInterruptVector(_: u8) []const u8 {
     return "Unknown";
 }
 
-pub fn prepareLinuxGuest(_: guest.Instance, _: u64) GuestLaunchState {
-    return .{};
+pub fn prepareGuest(_: alloc.PageAllocator, _: guest.BootData) Error!GuestPreparation {
+    return error.NotImplemented;
 }
 
 pub fn hlt() noreturn {

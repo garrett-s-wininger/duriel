@@ -1,11 +1,112 @@
+const alloc = @import("arch/allocation.zig");
 const hypervisor = @import("hypervisor.zig");
+const linux = @import("linux.zig");
 const std = @import("std");
 const uefi = std.os.uefi;
+
+fn readFileSize(source: *uefi.protocol.File) usize {
+    source.setPosition(std.math.maxInt(u64)) catch unreachable;
+    const source_size = source.getPosition() catch unreachable;
+    source.setPosition(0) catch unreachable;
+
+    return source_size;
+}
+
+fn readFileContentsToBuffer(destination: []u8, source: *uefi.protocol.File, source_size: usize) uefi.Error!void {
+    std.debug.assert(destination.len >= source_size);
+    var offset: usize = 0;
+    var left_to_read = source_size;
+
+    while (left_to_read > 0) {
+        const amount_read = source.read(destination[offset..]) catch {
+            return error.Unexpected;
+        };
+
+        if (amount_read == 0) return error.Unexpected;
+
+        offset += amount_read;
+        left_to_read -= amount_read;
+    }
+}
+
+fn loadDomainData(
+    logger: hypervisor.Logger,
+    boot_services: *uefi.tables.BootServices,
+) uefi.Error!linux.KernelBootData {
+    logger.log("Loading files from the ESP...");
+
+    const loaded_image = (try boot_services.handleProtocol(
+        uefi.protocol.LoadedImage,
+        uefi.handle,
+    )) orelse return error.Unsupported;
+
+    const device_handle = loaded_image.device_handle orelse return error.Unsupported;
+
+    const file_system = (try boot_services.handleProtocol(
+        uefi.protocol.SimpleFileSystem,
+        device_handle,
+    )) orelse return error.Unsupported;
+
+    const volume = file_system.openVolume() catch return error.Unexpected;
+    const kernel_path = std.unicode.utf8ToUtf16LeStringLiteral("\\domains\\placeholder\\kernel.bzImage");
+    const initramfs_path = std.unicode.utf8ToUtf16LeStringLiteral("\\domains\\placeholder\\initramfs.cpio");
+
+    const kernel_file = volume.open(kernel_path, .read, @bitCast(@as(u64, 0))) catch return error.Unexpected;
+    const initramfs_file = volume.open(initramfs_path, .read, @bitCast(@as(u64, 0))) catch return error.Unexpected;
+
+    defer {
+        kernel_file.close() catch unreachable;
+        initramfs_file.close() catch unreachable;
+        volume.close() catch unreachable;
+    }
+
+    const kernel_file_size = readFileSize(kernel_file);
+    const initramfs_file_size = readFileSize(initramfs_file);
+    const required_pages = std.math.divCeil(usize, kernel_file_size + initramfs_file_size, alloc.page_size) catch unreachable;
+    const boot_data_allocation = boot_services.allocatePages(.any, .loader_data, required_pages) catch {
+        logger.log("Allocation of domain boot data failed.");
+        return error.Unexpected;
+    };
+
+    const boot_data_buffer: []u8 = @as([*]u8, @ptrCast(boot_data_allocation))[0 .. required_pages * alloc.page_size];
+    @memset(boot_data_buffer, 0);
+
+    readFileContentsToBuffer(boot_data_buffer, kernel_file, kernel_file_size) catch {
+        logger.log("Kernel image could not be loaded from the ESP.");
+        return error.Unexpected;
+    };
+
+    readFileContentsToBuffer(boot_data_buffer[kernel_file_size..], initramfs_file, initramfs_file_size) catch {
+        logger.log("InitramFS could not be loaded from the ESP.");
+        return error.Unexpected;
+    };
+
+    return .{
+        .data = boot_data_buffer,
+        .kernel_offset = 0,
+        .kernel_size = kernel_file_size,
+        .initramfs_offset = kernel_file_size,
+        .initramfs_size = initramfs_file_size,
+    };
+}
 
 fn prepareForHandoffToHypervisor(
     logger: hypervisor.Logger,
     boot_services: *uefi.tables.BootServices,
 ) uefi.Error!hypervisor.UefiHandoff {
+    const domain_data = loadDomainData(logger, boot_services) catch |err| switch (err) {
+        error.Unsupported => {
+            logger.log("Loading data from the ESP is unsupported.");
+            return err;
+        },
+        else => {
+            return err;
+        },
+    };
+
+    logger.logFormatted("Kernel Image Size: {d} bytes", .{domain_data.kernel_size});
+    logger.logFormatted("InitramFS Size: {d} bytes", .{domain_data.initramfs_size});
+
     const memory_map_info = try boot_services.getMemoryMapInfo();
 
     if (memory_map_info.descriptor_version != 1) {
@@ -42,7 +143,10 @@ fn prepareForHandoffToHypervisor(
         },
     };
 
-    return .{ .memory_map = memory_map, .memory_map_buffer = allocation_buffer };
+    return .{
+        .memory_map = memory_map,
+        .boot_data = .{ .linux = domain_data },
+    };
 }
 
 pub fn main() uefi.Error!void {

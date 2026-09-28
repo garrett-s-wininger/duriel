@@ -2,6 +2,7 @@ const alloc = @import("arch/allocation.zig");
 const builtin = @import("builtin");
 const guest = @import("guest.zig");
 const logging = @import("logging.zig");
+const linux = @import("linux.zig");
 const std = @import("std");
 const uefi = std.os.uefi;
 
@@ -17,7 +18,10 @@ const Architecture = switch (builtin.cpu.arch) {
 
 pub const console_uart_base = Architecture.console_uart_base;
 
-pub const UefiHandoff = struct { memory_map: uefi.tables.MemoryMapSlice, memory_map_buffer: []u8 };
+pub const UefiHandoff = struct {
+    memory_map: uefi.tables.MemoryMapSlice,
+    boot_data: guest.BootData,
+};
 
 // NOTE(garrett): This allocator is intentionally a minimal, post-UEFI example. We only select
 // the single largest range of conventional memory from our map and never free.
@@ -130,27 +134,20 @@ pub fn enter(logger: Logger, handoff_data: UefiHandoff) noreturn {
     Architecture.initializeInterrupts(&panic);
     kernel_logger.log("Interrupt handlers installed.");
 
-    // NOTE(garrett): For our rudimentary guest, layout is 1 page code, 1 page RSP, and
-    // 4 pages for the PML4 tables.
-    const guest_memory = guest.Memory.init(allocator, 6) catch {
-        kernel_logger.log("Failed to allocate guest memory.");
-        Architecture.hlt();
-    };
-
-    kernel_logger.logFormatted("Assigned Guest Memory to 0x{X:0>8}", .{guest_memory.host_physical_start});
-    const translation_root = Architecture.initializeGuestAddressSpace(guest_memory);
-    kernel_logger.log("Guest pages tables configured.");
-
-    const instance = guest.Instance{ .memory = guest_memory };
-    const linux_boot_state = Architecture.prepareLinuxGuest(instance, translation_root);
-
     // TODO(garrett): We just apply an x64 HLT opcode here. If AArch64 takes off before we have
     // PVH, we'll need a comptime switch to handle that. Otherwise, we really want to
     // load the instructions from an actual boot target.
-    const opcodes: [*]u8 = @ptrFromInt(guest_memory.host_physical_start);
-    opcodes[0] = 0xF4;
+    const opcodes = guest.RawBootData{ .bytes = &.{0xF4} };
 
-    cpu.prepareVirtualization(allocator, instance, linux_boot_state) catch |err| switch (err) {
+    //const linux_boot_state = Architecture.prepareLinuxGuest(instance, translation_root, handoff_data.boot_data);
+    const prepared_guest = Architecture.prepareGuest(allocator, .{ .raw = opcodes }) catch {
+        kernel_logger.log("Failed to prepate guest.");
+        Architecture.hlt();
+    };
+
+    kernel_logger.logFormatted("Guest Memory Assignment: 0x{X:0>8}", .{prepared_guest.instance.memory.host_physical_start});
+
+    cpu.prepareVirtualization(allocator, prepared_guest) catch |err| switch (err) {
         error.MemoryRequestFailed => {
             kernel_logger.log("Required memory could not be allocated.");
             Architecture.hlt();
