@@ -134,15 +134,30 @@ pub fn enter(logger: Logger, handoff_data: UefiHandoff) noreturn {
     Architecture.initializeInterrupts(&panic);
     kernel_logger.log("Interrupt handlers installed.");
 
-    // TODO(garrett): We just apply an x64 HLT opcode here. If AArch64 takes off before we have
-    // PVH, we'll need a comptime switch to handle that. Otherwise, we really want to
-    // load the instructions from an actual boot target.
-    const opcodes = guest.RawBootData{ .bytes = &.{0xF4} };
-
-    //const linux_boot_state = Architecture.prepareLinuxGuest(instance, translation_root, handoff_data.boot_data);
-    const prepared_guest = Architecture.prepareGuest(allocator, .{ .raw = opcodes }) catch {
-        kernel_logger.log("Failed to prepate guest.");
+    // TODO(garrett): Create halting guests for AArch64 + RISC-V 64.
+    if (builtin.cpu.arch != .x86_64) {
+        kernel_logger.log("Current CPU architecture does not have a guest to run");
         Architecture.hlt();
+    }
+
+    // TODO(garrett): Move to Linux guest preparation.
+    const prepared_guest = Architecture.prepareGuest(allocator, .{ .raw = .{ .bytes = &.{0xF4} } }) catch |err| switch (err) {
+        error.InvalidGuestBootData => {
+            kernel_logger.log("Boot data determined to be invalid.");
+            Architecture.hlt();
+        },
+        error.MemoryRequestFailed => {
+            kernel_logger.log("Failed to obtain sufficient memory to launch guest.");
+            Architecture.hlt();
+        },
+        error.NotImplemented => {
+            kernel_logger.log("Reached unimplemented guest execution code.");
+            Architecture.hlt();
+        },
+        else => {
+            kernel_logger.log("Failed to prepare guest.");
+            Architecture.hlt();
+        },
     };
 
     kernel_logger.logFormatted("Guest Memory Assignment: 0x{X:0>8}", .{prepared_guest.instance.memory.host_physical_start});

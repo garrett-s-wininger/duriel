@@ -11,6 +11,7 @@ pub const ConsoleUart = uart.Pl011(uart.MemoryMapped(u32));
 pub const console_uart_base = uart_base;
 
 pub const Error = error{
+    InvalidGuestBootData,
     MemoryRequestFailed,
     NestedPagingNotSupported,
     NotImplemented,

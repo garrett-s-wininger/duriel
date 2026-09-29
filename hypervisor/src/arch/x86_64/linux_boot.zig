@@ -5,6 +5,7 @@ const linux = @import("../../linux.zig");
 const std = @import("std");
 
 pub const kernel_header_offset = 0x1f1;
+pub const high_memory_load_address = 0x1000000;
 
 pub const KernelHeader = packed struct(u984) {
     setup_sector_count: u8,
@@ -53,12 +54,63 @@ comptime {
     if (header_bit_size != 984) @compileError("Linux kernel header must be 123 bytes (984 bits) in size.");
 }
 
-pub fn parseHeader(kernel: []const u8) linux.Error!KernelHeader {
+pub const BootableKernel = struct {
+    header: KernelHeader,
+    image: []const u8,
+};
+
+pub fn parseHeader(kernel: []const u8) linux.Error!BootableKernel {
     const kernel_header_end = kernel_header_offset + @sizeOf(KernelHeader);
     if (kernel.len < kernel_header_end) return error.OutOfBounds;
 
     const header_pointer: *align(1) const KernelHeader = @ptrCast(kernel[kernel_header_offset..kernel_header_end].ptr);
-    return header_pointer.*;
+
+    const is_boot_flag_valid = header_pointer.*.boot_flag == 0xAA55;
+    if (!is_boot_flag_valid) return error.InvalidHeader;
+
+    // NOTE(garrett): The magic is defined as the string "HdrS"
+    const is_magic_valid = header_pointer.*.magic == 0x53726448;
+    if (!is_magic_valid) return error.InvalidHeader;
+
+    const boot_version = header_pointer.*.boot_version;
+    const boot_version_major = boot_version >> 8;
+    const boot_version_minor = boot_version & 0x00_FF;
+
+    // TODO(garrett): Be flexible and support older boot protocol versions.
+    if (boot_version_major != 2 or boot_version_minor < 15) return error.UnsupportedBootConfiguration;
+
+    const is_loaded_to_high_memory = (header_pointer.*.boot_protocol_flags & (1 << 0)) == 1;
+    if (!is_loaded_to_high_memory) return error.UnsupportedBootConfiguration;
+
+    const has_legacy_x64_entry_point = (header_pointer.*.extended_boot_protocol_flags & (1 << 0)) == 1;
+    if (!has_legacy_x64_entry_point) return error.UnsupportedBootConfiguration;
+
+    const two_mib = 2 * 1024 * 1024;
+    const is_two_mib_aligned = header_pointer.*.kernel_alignment == two_mib;
+    if (!is_two_mib_aligned) return error.UnsupportedBootConfiguration;
+
+    const preferred_address = header_pointer.*.preferred_loading_address;
+    if (preferred_address != high_memory_load_address and preferred_address != 0) return error.UnsupportedBootConfiguration;
+
+    const is_relocatable = header_pointer.*.is_kernel_relocatable != 0;
+    if (preferred_address == 0 and !is_relocatable) return error.InvalidHeader;
+
+    var setup_sectors: usize = header_pointer.*.setup_sector_count;
+    if (setup_sectors == 0) setup_sectors = 4;
+
+    // NOTE(garrett): There's always an extra first sector to initially boot from.
+    setup_sectors += 1;
+
+    const x64_entrypoint_offset = 0x200;
+    const setup_sector_length = setup_sectors * 512;
+    const code_length = kernel.len -| setup_sector_length;
+    if (code_length <= x64_entrypoint_offset) return error.InvalidHeader;
+    if (code_length > header_pointer.*.initialization_size) return error.InvalidHeader;
+
+    return .{
+        .header = header_pointer.*,
+        .image = kernel[setup_sector_length..],
+    };
 }
 
 pub const linux_x64_boot_gdt: [4]gdt.Entry = .{

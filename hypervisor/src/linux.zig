@@ -1,6 +1,10 @@
 const std = @import("std");
 
-pub const Error = error{OutOfBounds};
+pub const Error = error{
+    InvalidHeader,
+    OutOfBounds,
+    UnsupportedBootConfiguration,
+};
 
 pub const KernelBootData = struct {
     data: []const u8,
