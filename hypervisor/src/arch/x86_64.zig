@@ -21,6 +21,7 @@ pub const ConsoleUart = uart.Ns16550(x64_uart.PortMapped);
 pub const console_uart_base = x64_uart.com1;
 
 pub const Error = error{
+    CannotMeetGuestSpecification,
     InvalidGuestBootData,
     MemoryRequestFailed,
     NestedPagingNotSupported,
@@ -40,7 +41,11 @@ pub const Backend = union(enum) {
 
     const Self = @This();
 
-    pub fn prepareVirtualization(self: *Self, allocator: alloc.PageAllocator, prepared_guest: GuestPreparation) Error!void {
+    pub fn prepareVirtualization(
+        self: *Self,
+        allocator: alloc.PageAllocator,
+        prepared_guest: GuestPreparation,
+    ) Error!void {
         return switch (self.*) {
             .amd => |*backend| {
                 if (!backend.isVirtualizationSupported()) return error.VirtualizationNotSupported;
@@ -49,11 +54,27 @@ pub const Backend = union(enum) {
 
                 // TODO(garrett): Move from our hardcoded host save area and vm control
                 // (+ 4-level extended/nested page table) to a more dynamic setup.
-                const allocation_start_address = allocator.allocatePages(6) catch {
+                const required_amdv_pages = 2;
+
+                // TODO(garrett): Be more dynamic than our 1GiB limit.
+                const required_table_pages = 3;
+                const required_page_table_pages = std.math.divCeil(
+                    usize,
+                    prepared_guest.instance.memory.page_count,
+                    512,
+                ) catch unreachable;
+
+                const allocation_start_address = allocator.allocatePages(
+                    required_amdv_pages + required_table_pages + required_page_table_pages,
+                ) catch {
                     return error.MemoryRequestFailed;
                 };
 
-                backend.prepareVirtualization(allocation_start_address, prepared_guest.instance, prepared_guest.launch_state);
+                backend.prepareVirtualization(
+                    allocation_start_address,
+                    prepared_guest.instance,
+                    prepared_guest.launch_state,
+                );
             },
         };
     }
@@ -342,36 +363,67 @@ pub fn initializeInterrupts(handler: idt.FatalFaultHandler) void {
     inst.loadInterruptDescriptorTable(&interrupt_descriptor_register);
 }
 
-pub fn prepareGuest(allocator: alloc.PageAllocator, boot_data: guest.BootData) Error!GuestPreparation {
-    return switch (boot_data) {
-        .raw => |raw_boot| prepareRawGuest(allocator, raw_boot),
-        .linux => |linux_boot| prepareLinuxGuest(allocator, linux_boot),
+pub fn prepareGuest(allocator: alloc.PageAllocator, specs: guest.Specification) Error!GuestPreparation {
+    return switch (specs.boot_data) {
+        .raw => prepareRawGuest(allocator, specs),
+        .linux => prepareLinuxGuest(allocator, specs),
     };
 }
 
-fn prepareRawGuest(allocator: alloc.PageAllocator, raw_boot: guest.RawBootData) Error!GuestPreparation {
-    // TODO(garrett): Support larger binary files.
-    if (raw_boot.bytes.len > alloc.page_size) {
-        return error.InvalidGuestBootData;
-    }
+const kibibyte = 1024;
+const mebibyte = kibibyte * 1024;
+const gibibyte = mebibyte * 1024;
 
-    // NOTE(garrett): We register our guest with 1 code page, 1 stack page, and the
-    // 4-level page tables as the remainder for simplicity.
-    const memory = guest.Memory.init(allocator, 6) catch {
+fn requiredPagesForPageTable(non_table_pages: usize) Error!usize {
+    // TODO(garrett): Update calculations to include additional page directories
+    // as we only support up to 512 page directory entries to keep things simple.
+    // Since we don't support larger values, we can assume 1 PML4 page and 1 PDPT page.
+    const required_table_pages = 3;
+
+    // NOTE(garrett): The page tables provide 512 slots but each requires its own memory
+    // page to map so you effectively only get 511 slots instead, hence the denominator here.
+    return required_table_pages + (std.math.divCeil(
+        usize,
+        non_table_pages + required_table_pages,
+        511,
+    ) catch unreachable);
+}
+
+fn prepareRawGuest(allocator: alloc.PageAllocator, specs: guest.Specification) Error!GuestPreparation {
+    // TODO(garrett): Support 1Gib+ guests.
+    if (specs.memory_amount_mb > 1024) return error.NotImplemented;
+
+    // NOTE(garrett): We assume a singular stack page for simplicity. Our layout is code,
+    // stack, page tables, and then the remainder of memory.
+    const code_size = specs.boot_data.raw.bytes.len;
+    const code_pages = std.math.divCeil(usize, code_size, alloc.page_size) catch unreachable;
+    const stack_pages = 1;
+    const memory_pages = (specs.memory_amount_mb * mebibyte) / alloc.page_size;
+    const memory_map_pages = try requiredPagesForPageTable(code_pages + stack_pages + memory_pages);
+    const required_pages = code_pages + stack_pages + memory_map_pages + memory_pages;
+
+    if (required_pages > (gibibyte / alloc.page_size)) return error.NotImplemented;
+
+    const memory = guest.Memory.init(allocator, required_pages) catch {
         return error.MemoryRequestFailed;
     };
 
     const payload: [*]u8 = @ptrFromInt(memory.host_physical_start);
-    @memcpy(payload[0..raw_boot.bytes.len], raw_boot.bytes);
+    @memcpy(payload[0..code_size], specs.boot_data.raw.bytes);
 
     return .{
         .instance = .{ .memory = memory },
-        .launch_state = raw.launchState(memory),
+        .launch_state = raw.launchState(memory, .{
+            .code_pages = code_pages,
+            .stack_pages = stack_pages,
+            .memory_map_pages = memory_map_pages,
+            .memory_pages = memory_pages,
+        }),
     };
 }
 
-fn prepareLinuxGuest(_: alloc.PageAllocator, boot_data: linux.KernelBootData) Error!GuestPreparation {
-    const kernel = boot_data.kernel() catch return error.InvalidGuestBootData;
+fn prepareLinuxGuest(_: alloc.PageAllocator, specs: guest.Specification) Error!GuestPreparation {
+    const kernel = specs.boot_data.linux.kernel() catch return error.InvalidGuestBootData;
     const boot_configuration = x64_linux.parseHeader(kernel) catch return error.InvalidGuestBootData;
 
     const kernel_range_start = x64_linux.high_memory_load_address;
@@ -381,7 +433,7 @@ fn prepareLinuxGuest(_: alloc.PageAllocator, boot_data: linux.KernelBootData) Er
         boot_configuration.header.initialization_size,
     ) catch return error.InvalidGuestBootData;
 
-    const initramfs = boot_data.initramfs() catch return error.InvalidGuestBootData;
+    const initramfs = specs.boot_data.linux.initramfs() catch return error.InvalidGuestBootData;
     if (initramfs.len == 0) return error.InvalidGuestBootData;
 
     const initramfs_start = std.mem.alignForward(usize, kernel_range_end, alloc.page_size);

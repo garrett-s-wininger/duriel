@@ -40,6 +40,12 @@ pub fn Preparation(comptime LaunchState: type) type {
     };
 }
 
+pub const Specification = struct {
+    // TODO(garrett): CPU placement, hardware requisition, etc.
+    boot_data: BootData,
+    memory_amount_mb: usize,
+};
+
 pub const SecondStageFault = struct {
     guest_physical_address: u64,
     raw_status: u64,

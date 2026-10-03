@@ -11,6 +11,7 @@ pub const ConsoleUart = uart.Pl011(uart.MemoryMapped(u32));
 pub const console_uart_base = uart_base;
 
 pub const Error = error{
+    CannotMeetGuestSpecification,
     InvalidGuestBootData,
     MemoryRequestFailed,
     NestedPagingNotSupported,
@@ -57,7 +58,7 @@ pub fn nameForInterruptVector(_: u8) []const u8 {
     return "Unknown";
 }
 
-pub fn prepareGuest(_: alloc.PageAllocator, _: guest.BootData) Error!GuestPreparation {
+pub fn prepareGuest(_: alloc.PageAllocator, _: guest.Specification) Error!GuestPreparation {
     return error.NotImplemented;
 }
 

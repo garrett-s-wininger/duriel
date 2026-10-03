@@ -66,31 +66,56 @@ pub const raw_boot_gdt: [3]gdt.Entry = .{
     },
 };
 
-// TODO(garrett): We're configuring a 6-page memory layout for a halting virtual machine,
-// rather than a realistic one. As we get closer to PVH booting and more production
-// features, we'll need to be able to configure this better.
-fn initializeGuestAddressSpace(memory: guest.Memory) u64 {
-    const host_pml4_start = memory.host_physical_start + (2 * alloc.page_size);
+pub const MemoryConfiguration = struct {
+    code_pages: usize = 1,
+    stack_pages: usize = 1,
+    memory_map_pages: usize = 4,
+    memory_pages: usize = 0,
+};
+
+// TODO(garrett): We still don't support more than a single page directory table (<= 1GiB) but in
+// the future we'll need to add some more flexibility to this implementation.
+fn initializeGuestAddressSpace(memory: guest.Memory, config: MemoryConfiguration) u64 {
+    const pml4_offset = ((config.code_pages + config.stack_pages) * alloc.page_size);
+    const host_pml4_start = memory.host_physical_start + pml4_offset;
     const host_page_directory_pointer_start = host_pml4_start + alloc.page_size;
     const host_page_directory_table_start = host_pml4_start + (2 * alloc.page_size);
     const host_page_table_start = host_pml4_start + (3 * alloc.page_size);
 
-    const guest_code_start = 0x0000;
-    const guest_stack_start = 0x1000;
-    const guest_pml4_start = 0x2000;
-    const guest_pdpt_start = 0x3000;
-    const guest_pdt_start = 0x4000;
-    const guest_pt_start = 0x5000;
+    const guest_pml4_start = pml4_offset;
+    const guest_pdpt_start = pml4_offset + alloc.page_size;
+    const guest_pdt_start = pml4_offset + (2 * alloc.page_size);
+    const guest_pt_start = pml4_offset + (3 * alloc.page_size);
 
-    const pt: *paging.PageTable = @ptrFromInt(host_page_table_start);
-    pt[0].physical_address = @truncate(guest_code_start >> 12);
-    pt[0]._low = paging.present;
-    pt[1].physical_address = @truncate(guest_stack_start >> 12);
-    pt[1]._low = paging.present | paging.read_write;
+    const total_pages = config.code_pages + config.memory_map_pages + config.stack_pages + config.memory_pages;
 
     const pdt: *paging.PageDirectoryTable = @ptrFromInt(host_page_directory_table_start);
     pdt[0].page_table_address = @truncate(guest_pt_start >> 12);
     pdt[0]._low = paging.present | paging.read_write;
+
+    var page_directory_entry_index: usize = 0;
+    var page_table_entry_index: usize = 0;
+    var pt: *paging.PageTable = @ptrFromInt(host_page_table_start);
+
+    for (0..total_pages) |config_page_index| {
+        if (page_table_entry_index == 512) {
+            page_table_entry_index = 0;
+            page_directory_entry_index += 1;
+
+            pt = @ptrFromInt(@intFromPtr(pt) + @sizeOf(paging.PageTable));
+            pdt[page_directory_entry_index].page_table_address = @truncate((guest_pt_start + (page_directory_entry_index * @sizeOf(paging.PageTable))) >> 12);
+            pdt[page_directory_entry_index]._low = paging.present | paging.read_write;
+        }
+
+        pt[page_table_entry_index].physical_address = @truncate((alloc.page_size * config_page_index) >> 12);
+        pt[page_table_entry_index]._low = paging.present;
+
+        if (config_page_index >= config.code_pages) {
+            pt[page_table_entry_index]._low |= paging.read_write;
+        }
+
+        page_table_entry_index += 1;
+    }
 
     const pdpt: *paging.PageDirectoryPointerTable = @ptrFromInt(host_page_directory_pointer_start);
     pdpt[0].page_directory_address = @truncate(guest_pdt_start >> 12);
@@ -103,8 +128,8 @@ fn initializeGuestAddressSpace(memory: guest.Memory) u64 {
     return guest_pml4_start;
 }
 
-pub fn launchState(memory: guest.Memory) guest_state.LaunchState {
-    const guest_pml4_address = initializeGuestAddressSpace(memory);
+pub fn launchState(memory: guest.Memory, config: MemoryConfiguration) guest_state.LaunchState {
+    const guest_pml4_address = initializeGuestAddressSpace(memory, config);
     const guest_gdt_address = guest_pml4_address - @sizeOf(@TypeOf(raw_boot_gdt));
     const guest_gdt: [*]gdt.Entry = @ptrFromInt(memory.host_physical_start + guest_gdt_address);
 

@@ -141,7 +141,24 @@ pub fn enter(logger: Logger, handoff_data: UefiHandoff) noreturn {
     }
 
     // TODO(garrett): Move to Linux guest preparation.
-    const prepared_guest = Architecture.prepareGuest(allocator, .{ .raw = .{ .bytes = &.{0xF4} } }) catch |err| switch (err) {
+    const prepared_guest = Architecture.prepareGuest(
+        allocator,
+        .{
+            .boot_data = .{
+                .raw = .{
+                    .bytes = &.{
+                        0x48, 0xC7, 0xC0, 0x00, 0x00, 0x20, 0x00, // mov rax, 0x0020_0000
+                        0xC6, 0x00, 0x5A, // mov byte ptr [rax], 0x5A
+                        0x80, 0x38, 0x5A, // cmp byte ptr [rax], 0x5A
+                        0x74, 0x02, // je success
+                        0x0F, 0x0B, // UD2
+                        0xF4, // success: hlt
+                    },
+                },
+            },
+            .memory_amount_mb = 2,
+        },
+    ) catch |err| switch (err) {
         error.InvalidGuestBootData => {
             kernel_logger.log("Boot data determined to be invalid.");
             Architecture.hlt();

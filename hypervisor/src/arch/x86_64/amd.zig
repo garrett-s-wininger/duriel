@@ -301,10 +301,17 @@ pub const Backend = struct {
     }
 
     fn prepareNestedPageTables(pml4_start: u64, instance: guest.Memory) u64 {
+        const base_page_table_pages = 3;
+        const memory_map_pages = base_page_table_pages + (std.math.divCeil(
+            usize,
+            instance.page_count,
+            512,
+        ) catch unreachable);
+
         const tables = @as(
             [*]align(alloc.page_size) u8,
             @ptrFromInt(pml4_start),
-        )[0 .. 4 * alloc.page_size];
+        )[0 .. memory_map_pages * alloc.page_size];
 
         @memset(tables, 0);
 
@@ -315,22 +322,33 @@ pub const Backend = struct {
         // NOTE(garrett): Nested page table walks are considered user accesses and so
         // must be granted user permissions in order for them to be accessible when
         // the walk occurs.
-        const npt_read_only = paging.present | paging.user_accessible;
-        const npt_read_write = npt_read_only | paging.read_write;
-
-        const pt: *paging.PageTable = @ptrFromInt(page_table_start);
-        for (0..instance.page_count) |idx| {
-            pt[idx].physical_address = @truncate(instance.host_physical_start + (idx * alloc.page_size) >> 12);
-            pt[idx]._low = npt_read_only;
-
-            if (idx != 0) {
-                pt[idx]._low = npt_read_write;
-            }
-        }
+        const npt_read_write = paging.present | paging.user_accessible | paging.read_write;
 
         const pdt: *paging.PageDirectoryTable = @ptrFromInt(page_directory_table_start);
         pdt[0].page_table_address = @truncate(page_table_start >> 12);
         pdt[0]._low = npt_read_write;
+
+        // TODO(garrett): Formulate a method for more trusted workloads, such that the guest cannot modify its
+        // page tables to change its own code regions.
+        var pt: *paging.PageTable = @ptrFromInt(page_table_start);
+        var page_directory_table_entry_index: usize = 0;
+        var page_table_entry_index: usize = 0;
+
+        for (0..instance.page_count) |idx| {
+            if (page_table_entry_index == 512) {
+                page_table_entry_index = 0;
+                page_directory_table_entry_index += 1;
+                pt = @ptrFromInt(@intFromPtr(pt) + @sizeOf(paging.PageTable));
+
+                pdt[page_directory_table_entry_index].page_table_address = @truncate(page_table_start + (page_directory_table_entry_index * @sizeOf(paging.PageTable)) >> 12);
+                pdt[page_directory_table_entry_index]._low = npt_read_write;
+            }
+
+            pt[page_table_entry_index].physical_address = @truncate(instance.host_physical_start + (idx * alloc.page_size) >> 12);
+            pt[page_table_entry_index]._low = npt_read_write;
+
+            page_table_entry_index += 1;
+        }
 
         const pdpt: *paging.PageDirectoryPointerTable = @ptrFromInt(page_directory_pointer_start);
         pdpt[0].page_directory_address = @truncate(page_directory_table_start >> 12);
