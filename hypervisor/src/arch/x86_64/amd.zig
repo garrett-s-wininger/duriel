@@ -227,6 +227,10 @@ const VirtualMachineControlBlock = struct {
         return self.ptr(0x010, InterceptBlock2);
     }
 
+    fn rax(self: Self) *u64 {
+        return self.savedStatePtr(0x1F8, u64);
+    }
+
     fn rip(self: Self) *u64 {
         return self.savedStatePtr(0x178, u64);
     }
@@ -240,12 +244,87 @@ const VirtualMachineControlBlock = struct {
     }
 };
 
-fn vmrun(vmcb_address: u64) void {
+fn vmrunEntry() callconv(.naked) void {
+    // NOTE(garrett): This assumes the MSFT x64 calling conventions. The VMCB and save state area do
+    // not allow us to set general purpose registers (except RAX + RSP). In order to be able to set
+    // these, we take them from the guest register configuration after pushing our host registers
+    // onto the stack. Once we exit, host registers are restored so we can resume execution.
     asm volatile (
+        \\
+        \\ subq $520, %%rsp
+        \\ fxsave64 (%%rsp)
+        \\
+        \\ pushq %%rbx
+        \\ pushq %%rbp
+        \\ pushq %%rdi
+        \\ pushq %%rsi
+        \\ pushq %%r12
+        \\ pushq %%r13
+        \\ pushq %%r14
+        \\ pushq %%r15
+        \\
+        \\ pushq %%rdx
+        \\ pushq %%rcx
+        \\
+        \\ movq 8(%%rsp), %%rax
+        \\ movq 8(%%rax), %%rbx
+        \\ movq 16(%%rax), %%rcx
+        \\ movq 24(%%rax), %%rdx
+        \\ movq 32(%%rax), %%rdi
+        \\ movq 40(%%rax), %%rsi
+        \\ movq 48(%%rax), %%rbp
+        \\ movq 56(%%rax), %%r8
+        \\ movq 64(%%rax), %%r9
+        \\ movq 72(%%rax), %%r10
+        \\ movq 80(%%rax), %%r11
+        \\ movq 88(%%rax), %%r12
+        \\ movq 96(%%rax), %%r13
+        \\ movq 104(%%rax), %%r14
+        \\ movq 112(%%rax), %%r15
+        \\ movq (%%rsp), %%rax
+        \\
         \\ vmrun
-        :
-        : [vmcb_address] "{rax}" (vmcb_address),
-        : .{ .memory = true });
+        \\
+        \\ movq 8(%%rsp), %%rax
+        \\ movq %%rbx, 8(%%rax)
+        \\ movq %%rcx, 16(%%rax)
+        \\ movq %%rdx, 24(%%rax)
+        \\ movq %%rdi, 32(%%rax)
+        \\ movq %%rsi, 40(%%rax)
+        \\ movq %%rbp, 48(%%rax)
+        \\ movq %%r8, 56(%%rax)
+        \\ movq %%r9, 64(%%rax)
+        \\ movq %%r10, 72(%%rax)
+        \\ movq %%r11, 80(%%rax)
+        \\ movq %%r12, 88(%%rax)
+        \\ movq %%r13, 96(%%rax)
+        \\ movq %%r14, 104(%%rax)
+        \\ movq %%r15, 112(%%rax)
+        \\
+        \\ addq $16, %%rsp
+        \\ popq %%r15
+        \\ popq %%r14
+        \\ popq %%r13
+        \\ popq %%r12
+        \\ popq %%rsi
+        \\ popq %%rdi
+        \\ popq %%rbp
+        \\ popq %%rbx
+        \\
+        \\ fxrstor64 (%%rsp)
+        \\ addq $520, %%rsp
+        \\
+        \\ retq
+    );
+}
+
+fn vmrun(vmcb_address: u64, registers: *guest_state.GeneralPurposeRegisters) void {
+    const entry: *const fn (
+        u64,
+        *guest_state.GeneralPurposeRegisters,
+    ) callconv(.c) void = @ptrCast(&vmrunEntry);
+
+    entry(vmcb_address, registers);
 }
 
 fn vmsave(save_address: u64) void {
@@ -266,6 +345,7 @@ pub const Backend = struct {
     max_standard_func: u32,
     max_extended_func: u32,
     vmcb: ?VirtualMachineControlBlock = null,
+    general_purpose_registers: ?guest_state.GeneralPurposeRegisters = null,
 
     const Self = @This();
 
@@ -406,6 +486,7 @@ pub const Backend = struct {
             .base = launch_state.idtr.base,
         };
 
+        control_block.rax().* = launch_state.general_purpose_registers.rax;
         control_block.rip().* = launch_state.instruction_pointer;
         control_block.rsp().* = launch_state.stack_pointer;
         control_block.cr0().* = launch_state.cr0;
@@ -426,11 +507,18 @@ pub const Backend = struct {
 
         control_block.nested_paging().* = NestedPagingControl{ .is_nested_paging_enabled = 1, ._reserved = 0 };
         self.vmcb = control_block;
+        self.general_purpose_registers = launch_state.general_purpose_registers;
     }
 
-    pub fn runGuest(self: Self) VmExit {
+    pub fn runGuest(self: *Self) VmExit {
         const vmcb = self.vmcb orelse @panic("VMCB not prepared");
-        vmrun(@intFromPtr(vmcb.raw));
+        const registers = if (self.general_purpose_registers) |*regs|
+            regs
+        else
+            @panic("Guest registers not prepared");
+
+        vmrun(@intFromPtr(vmcb.raw), registers);
+        registers.rax = vmcb.rax().*;
 
         return .{
             .code = vmcb.exit_code().*,

@@ -5,7 +5,7 @@ pub const DescriptorTableState = struct {
     limit: u16,
 };
 
-pub const GeneralPurposeRegisters = struct {
+pub const GeneralPurposeRegisters = extern struct {
     rax: u64,
     rbx: u64,
     rcx: u64,

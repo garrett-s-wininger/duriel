@@ -4,29 +4,44 @@ const max_line = 80;
 
 pub fn Logger(comptime Sink: type) type {
     return struct {
-        sink: *Sink,
+        var sink: ?*Sink = null;
 
-        pub fn log(self: @This(), comptime message: []const u8) void {
-            for (message) |char| {
-                self.sink.putc(char);
-            }
-
-            self.sink.putc('\r');
-            self.sink.putc('\n');
+        pub fn install(new_sink: *Sink) void {
+            sink = new_sink;
         }
 
-        pub fn logFormatted(self: @This(), comptime format: []const u8, args: anytype) void {
-            var buffer: [max_line]u8 = undefined;
-            const message = std.fmt.bufPrint(&buffer, format, args) catch {
-                return;
-            };
+        pub fn logFn(
+            comptime level: std.log.Level,
+            comptime scope: @EnumLiteral(),
+            comptime format: []const u8,
+            args: anytype,
+        ) void {
+            // TODO(garrett): Implement fancier log message output.
+            _ = level;
+            _ = scope;
+
+            if (sink == null) return;
+            logFormatted(format, args);
+        }
+
+        pub fn log(message: []const u8) void {
+            const output = sink orelse return;
 
             for (message) |char| {
-                self.sink.putc(char);
+                output.putc(char);
             }
 
-            self.sink.putc('\r');
-            self.sink.putc('\n');
+            output.putc('\r');
+            output.putc('\n');
+        }
+
+        pub fn logFormatted(comptime format: []const u8, args: anytype) void {
+            var buffer: [max_line]u8 = undefined;
+            const message = std.fmt.bufPrint(&buffer, format, args) catch {
+                @panic("Log message exceeded capacity");
+            };
+
+            log(message);
         }
     };
 }

@@ -91,9 +91,9 @@ pub const Backend = union(enum) {
         };
     }
 
-    pub fn runGuest(self: Self) guest.Exit {
-        return switch (self) {
-            .amd => |backend| {
+    pub fn runGuest(self: *Self) guest.Exit {
+        return switch (self.*) {
+            .amd => |*backend| {
                 const exit = backend.runGuest();
 
                 switch (exit.code) {
@@ -422,7 +422,7 @@ fn prepareRawGuest(allocator: alloc.PageAllocator, specs: guest.Specification) E
     };
 }
 
-fn prepareLinuxGuest(_: alloc.PageAllocator, specs: guest.Specification) Error!GuestPreparation {
+fn prepareLinuxGuest(allocator: alloc.PageAllocator, specs: guest.Specification) Error!GuestPreparation {
     const kernel = specs.boot_data.linux.kernel() catch return error.InvalidGuestBootData;
     const boot_configuration = x64_linux.parseHeader(kernel) catch return error.InvalidGuestBootData;
 
@@ -445,8 +445,39 @@ fn prepareLinuxGuest(_: alloc.PageAllocator, specs: guest.Specification) Error!G
 
     if (initramfs_end - 1 > boot_configuration.header.initrd_max_address) return error.InvalidGuestBootData;
 
-    // TODO(garrett): Continue to flesh out
-    return error.NotImplemented;
+    // NOTE(garrett): The 256 is because each MB is half the entries in a single page table (512 / 2 = 256)
+    const memory_pages = std.math.mul(
+        usize,
+        specs.memory_amount_mb,
+        256,
+    ) catch std.math.maxInt(usize);
+
+    const pages_to_initramfs_end = std.math.divCeil(
+        usize,
+        initramfs_end,
+        alloc.page_size,
+    ) catch unreachable;
+
+    const required_pages = std.math.add(
+        usize,
+        pages_to_initramfs_end,
+        memory_pages,
+    ) catch std.math.maxInt(usize);
+
+    const pages_in_1gib = gibibyte / alloc.page_size;
+    if (required_pages > pages_in_1gib) return error.MemoryRequestFailed;
+
+    const memory = guest.Memory.init(allocator, required_pages) catch {
+        return error.MemoryRequestFailed;
+    };
+
+    const kernel_layout = x64_linux.KernelMemoryLayout{ .initramfs_address = initramfs_start };
+    x64_linux.initializeGuestMemory(memory, kernel_layout, boot_configuration, initramfs);
+
+    return .{
+        .instance = .{ .memory = memory },
+        .launch_state = x64_linux.launchState(kernel_layout),
+    };
 }
 
 pub fn hlt() noreturn {

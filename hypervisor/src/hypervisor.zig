@@ -61,7 +61,7 @@ const BootstrapAllocator = struct {
             if (descriptor.type != .conventional_memory) continue;
             if (selected != null and descriptor.number_of_pages <= selected.?.number_of_pages) continue;
 
-            kernel_logger.logFormatted(
+            std.log.debug(
                 "Memory Selection: 0x{x} for {d} pages",
                 .{ descriptor.physical_start, descriptor.number_of_pages },
             );
@@ -83,21 +83,19 @@ const BootstrapAllocator = struct {
     }
 };
 
-var kernel_logger: Logger = undefined;
-
 fn x86_64_panic(fault_info: Architecture.FaultInfo) void {
-    kernel_logger.logFormatted("\r\nKernel Panic from {s} (Error Code:  0x{X:0>16}):\r\n", .{
+    std.log.err("\r\nKernel Panic from {s} (Error Code:  0x{X:0>16}):\r\n", .{
         Architecture.nameForInterruptVector(fault_info.interrupt_vector),
         fault_info.error_code,
     });
 
     if (fault_info.fault_address) |address| {
-        kernel_logger.logFormatted("  CR2:    0x{X:0>16}", .{address});
+        std.log.err("  CR2:    0x{X:0>16}", .{address});
     }
 
-    kernel_logger.logFormatted("  RIP:    0x{X:0>16}", .{fault_info.instruction_pointer});
-    kernel_logger.logFormatted("  RSP:    0x{X:0>16}", .{fault_info.stack_pointer});
-    kernel_logger.logFormatted("  RFLAGS: 0x{X:0>16}", .{fault_info.register_flags});
+    std.log.err("  RIP:    0x{X:0>16}", .{fault_info.instruction_pointer});
+    std.log.err("  RSP:    0x{X:0>16}", .{fault_info.stack_pointer});
+    std.log.err("  RFLAGS: 0x{X:0>16}", .{fault_info.register_flags});
 }
 
 fn panic(fault_info: Architecture.FaultInfo) noreturn {
@@ -105,99 +103,85 @@ fn panic(fault_info: Architecture.FaultInfo) noreturn {
     Architecture.hlt();
 }
 
-pub fn enter(logger: Logger, handoff_data: UefiHandoff) noreturn {
-    kernel_logger = logger;
-
+pub fn enter(handoff_data: UefiHandoff) noreturn {
     var cpu = Architecture.detect() catch {
-        kernel_logger.log("Unsupported processor vendor detected.");
+        std.log.err("Unsupported processor vendor detected.", .{});
         Architecture.hlt();
     };
 
     var bootstrap_allocator = BootstrapAllocator.init(handoff_data.memory_map) catch {
-        kernel_logger.log("No valid memory range could be found for initialization.");
+        std.log.err("No valid memory range could be found for initialization.", .{});
         Architecture.hlt();
     };
 
     const allocator = bootstrap_allocator.asPageAllocator();
     Architecture.initializeHostAddressSpace(allocator) catch {
-        kernel_logger.log("Failed to initialize host address space.");
+        std.log.err("Failed to initialize host address space.", .{});
         Architecture.hlt();
     };
 
-    kernel_logger.log("Host page tables installed.");
+    std.log.info("Host page tables installed.", .{});
     Architecture.initializeHostExecutionContext() catch {
-        kernel_logger.log("Failed to configure host execution context.");
+        std.log.err("Failed to configure host execution context.", .{});
         Architecture.hlt();
     };
 
-    kernel_logger.log("Host execution context configured.");
+    std.log.info("Host execution context configured.", .{});
     Architecture.initializeInterrupts(&panic);
-    kernel_logger.log("Interrupt handlers installed.");
+    std.log.info("Interrupt handlers installed.", .{});
 
     // TODO(garrett): Create halting guests for AArch64 + RISC-V 64.
     if (builtin.cpu.arch != .x86_64) {
-        kernel_logger.log("Current CPU architecture does not have a guest to run");
+        std.log.err("Current CPU architecture does not have a guest to run", .{});
         Architecture.hlt();
     }
 
-    // TODO(garrett): Move to Linux guest preparation.
     const prepared_guest = Architecture.prepareGuest(
         allocator,
         .{
-            .boot_data = .{
-                .raw = .{
-                    .bytes = &.{
-                        0x48, 0xC7, 0xC0, 0x00, 0x00, 0x20, 0x00, // mov rax, 0x0020_0000
-                        0xC6, 0x00, 0x5A, // mov byte ptr [rax], 0x5A
-                        0x80, 0x38, 0x5A, // cmp byte ptr [rax], 0x5A
-                        0x74, 0x02, // je success
-                        0x0F, 0x0B, // UD2
-                        0xF4, // success: hlt
-                    },
-                },
-            },
-            .memory_amount_mb = 2,
+            .boot_data = handoff_data.boot_data,
+            .memory_amount_mb = 64,
         },
     ) catch |err| switch (err) {
         error.InvalidGuestBootData => {
-            kernel_logger.log("Boot data determined to be invalid.");
+            std.log.err("Boot data determined to be invalid.", .{});
             Architecture.hlt();
         },
         error.MemoryRequestFailed => {
-            kernel_logger.log("Failed to obtain sufficient memory to launch guest.");
+            std.log.err("Failed to obtain sufficient memory to launch guest.", .{});
             Architecture.hlt();
         },
         error.NotImplemented => {
-            kernel_logger.log("Reached unimplemented guest execution code.");
+            std.log.err("Reached unimplemented guest execution code.", .{});
             Architecture.hlt();
         },
         else => {
-            kernel_logger.log("Failed to prepare guest.");
+            std.log.err("Failed to prepare guest.", .{});
             Architecture.hlt();
         },
     };
 
-    kernel_logger.logFormatted("Guest Memory Assignment: 0x{X:0>8}", .{prepared_guest.instance.memory.host_physical_start});
+    std.log.info("Guest Memory Assignment: 0x{X:0>8}", .{prepared_guest.instance.memory.host_physical_start});
 
     cpu.prepareVirtualization(allocator, prepared_guest) catch |err| switch (err) {
         error.MemoryRequestFailed => {
-            kernel_logger.log("Required memory could not be allocated.");
+            std.log.err("Required memory could not be allocated.", .{});
             Architecture.hlt();
         },
         error.NestedPagingNotSupported => {
-            kernel_logger.log("Nested paging is not supported.");
+            std.log.err("Nested paging is not supported.", .{});
             Architecture.hlt();
         },
         error.VirtualizationDisabled => {
-            kernel_logger.log("Virtualization has been disabled, please check firmware settings.");
+            std.log.err("Virtualization has been disabled, please check firmware settings.", .{});
             Architecture.hlt();
         },
         error.VirtualizationNotSupported => {
-            kernel_logger.log("Processor does not support virtualization.");
+            std.log.err("Processor does not support virtualization.", .{});
             Architecture.hlt();
         },
         else => {
-            kernel_logger.log("An unknown error occurred; aborting.");
+            std.log.err("An unknown error occurred; aborting.", .{});
             Architecture.hlt();
         },
     };
@@ -205,10 +189,10 @@ pub fn enter(logger: Logger, handoff_data: UefiHandoff) noreturn {
     const status = cpu.runGuest();
 
     switch (status) {
-        .halt => kernel_logger.log("Guest boot successful!"),
+        .halt => std.log.info("Guest halted.", .{}),
         .second_stage_fault => |fault_info| {
-            kernel_logger.log("Guest encountered nested page fault:");
-            kernel_logger.logFormatted(
+            std.log.err("Guest encountered nested page fault:", .{});
+            std.log.err(
                 "  Address: 0x{X:0>16}  Status: 0x{X:0>16}",
                 .{
                     fault_info.guest_physical_address,
@@ -216,12 +200,12 @@ pub fn enter(logger: Logger, handoff_data: UefiHandoff) noreturn {
                 },
             );
         },
-        .unexpected => |exit_code| kernel_logger.logFormatted(
+        .unexpected => |exit_code| std.log.err(
             "Guest exited unexpectedly with code: 0x{X:0>16}",
             .{exit_code},
         ),
     }
 
-    kernel_logger.log("Hypervisor now halted.");
+    std.log.info("Hypervisor halted.", .{});
     Architecture.hlt();
 }
