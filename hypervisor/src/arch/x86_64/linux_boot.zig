@@ -217,64 +217,7 @@ pub const KernelMemoryLayout = struct {
     initramfs_address: u64,
 };
 
-pub fn initializeGuestMemory(
-    memory: guest.Memory,
-    layout: KernelMemoryLayout,
-    kernel: BootableKernel,
-    initramfs: []const u8,
-) void {
-    const memory_bytes = @as([*]u8, @ptrFromInt(memory.host_physical_start));
-    const guest_gdt: [*]gdt.Entry = @ptrFromInt(@intFromPtr(&memory_bytes[0]) + layout.boot_gdt_address);
-    @memcpy(guest_gdt[0..linux_x64_boot_gdt.len], linux_x64_boot_gdt[0..]);
-
-    const kernel_start = layout.kernel_load_address;
-    const kernel_end = kernel_start + kernel.image.len;
-    @memcpy(memory_bytes[kernel_start..kernel_end], kernel.image);
-
-    const initramfs_start = layout.initramfs_address;
-    const initramfs_end = initramfs_start + initramfs.len;
-    @memcpy(memory_bytes[initramfs_start..initramfs_end], initramfs);
-
-    const kernel_header_start = kernel_header_offset + layout.zero_page_address;
-    const kernel_header_end = kernel_header_start + @sizeOf(KernelHeader);
-    @memcpy(memory_bytes[kernel_header_start..kernel_header_end], std.mem.asBytes(&kernel.header));
-
-    const e820_entry_count: *u8 = @ptrFromInt(
-        memory.host_physical_start + layout.zero_page_address + e820_count_zero_page_offset,
-    );
-
-    e820_entry_count.* = 2;
-
-    var e820_entries: [*]E820Entry = @ptrFromInt(
-        memory.host_physical_start + layout.zero_page_address + e820_array_zero_page_offset,
-    );
-
-    e820_entries[0] = E820Entry{
-        .base_address = 0,
-        .size = layout.kernel_load_address,
-        .type = @intFromEnum(E820RegionType.reserved),
-    };
-
-    e820_entries[1] = E820Entry{
-        .base_address = layout.kernel_load_address,
-        .size = (memory.page_count * alloc.page_size) - layout.kernel_load_address,
-        .type = @intFromEnum(E820RegionType.usable),
-    };
-
-    // TODO(garrett): Make this more flexible and bounds check when we do as we must be under the header's
-    // command line size which this hardcoded example should not exceed.
-    const command_line: []const u8 = "earlycon=uart8250,io,0x3F8 console=ttyS0,115200 rdinit=/init";
-    const command_line_end = layout.command_line_address + command_line.len;
-    @memcpy(memory_bytes[layout.command_line_address..command_line_end], command_line);
-
-    // TODO(garrett): We can safely cast these because we've artifically limited our memory allocation for VMs
-    // down to 1GiB at max. When this changes, we'll need to be more careful here.
-    const guest_kernel_header: *align(1) KernelHeader = @ptrFromInt(memory.host_physical_start + kernel_header_start);
-    guest_kernel_header.bootloader_identifier = 0xFF;
-    guest_kernel_header.command_line_pointer = @intCast(layout.command_line_address);
-    guest_kernel_header.*.ramdisk_load_address = @intCast(initramfs_start);
-    guest_kernel_header.*.ramdisk_size = @intCast(initramfs.len);
-
+fn configureTemporaryPageTables(memory: guest.Memory, layout: KernelMemoryLayout) u64 {
     // NOTE(garrett): Since Linux is going to remap its own tables, we can be lazy and make everything
     // read/write to start with.
     const pml4_start = memory.host_physical_start + layout.pml4_address;
@@ -313,6 +256,96 @@ pub fn initializeGuestMemory(
     const pml4: *paging.PageMapLevel4Table = @ptrFromInt(pml4_start);
     pml4[0].page_directory_pointer_address = @truncate((@intFromPtr(pdpt) - memory.host_physical_start) >> 12);
     pml4[0]._low = paging.present | paging.read_write;
+
+    return @intFromPtr(pt) + @sizeOf(paging.PageTable);
+}
+
+fn copyBinaryData(
+    memory: [*]u8,
+    layout: KernelMemoryLayout,
+    kernel: BootableKernel,
+    initramfs: []const u8,
+) void {
+    const kernel_start = layout.kernel_load_address;
+    const kernel_end = kernel_start + kernel.image.len;
+    @memcpy(memory[kernel_start..kernel_end], kernel.image);
+
+    const initramfs_start = layout.initramfs_address;
+    const initramfs_end = initramfs_start + initramfs.len;
+    @memcpy(memory[initramfs_start..initramfs_end], initramfs);
+
+    const kernel_header_start = kernel_header_offset + layout.zero_page_address;
+    const kernel_header_end = kernel_header_start + @sizeOf(KernelHeader);
+    @memcpy(memory[kernel_header_start..kernel_header_end], std.mem.asBytes(&kernel.header));
+}
+
+fn provideE820MemoryRegions(memory: guest.Memory, layout: KernelMemoryLayout, end_of_page_tables: u64) void {
+    // NOTE(garrett): It's expected that bootloaders populate these entries so that Linux can divy
+    // up its own memory regions. The main thing we need to make sure is that _some_ memory is
+    // usale below 1MiB so that an assembly trampline can be copied and is accessible in the
+    // 20-bit addressing of real mode when secondary application processors start up under SMP
+    // configurations.
+    const e820_entry_count: *u8 = @ptrFromInt(
+        memory.host_physical_start + layout.zero_page_address + e820_count_zero_page_offset,
+    );
+
+    e820_entry_count.* = 2;
+
+    var e820_entries: [*]E820Entry = @ptrFromInt(
+        memory.host_physical_start + layout.zero_page_address + e820_array_zero_page_offset,
+    );
+
+    const pml4_end_offset = (end_of_page_tables + @sizeOf(paging.PageTable) - memory.host_physical_start);
+    e820_entries[0] = E820Entry{
+        .base_address = 0,
+        .size = pml4_end_offset,
+        .type = @intFromEnum(E820RegionType.reserved),
+    };
+
+    e820_entries[1] = E820Entry{
+        .base_address = pml4_end_offset,
+        .size = (memory.page_count * alloc.page_size) - layout.kernel_load_address,
+        .type = @intFromEnum(E820RegionType.usable),
+    };
+}
+
+pub fn initializeGuestMemory(
+    memory: guest.Memory,
+    layout: KernelMemoryLayout,
+    kernel: BootableKernel,
+    initramfs: []const u8,
+) void {
+    const memory_bytes = @as([*]u8, @ptrFromInt(memory.host_physical_start));
+    const guest_gdt: [*]gdt.Entry = @ptrFromInt(@intFromPtr(&memory_bytes[0]) + layout.boot_gdt_address);
+    @memcpy(guest_gdt[0..linux_x64_boot_gdt.len], linux_x64_boot_gdt[0..]);
+
+    copyBinaryData(memory_bytes, layout, kernel, initramfs);
+
+    // TODO(garrett): Make this more flexible and bounds check when we do as we must be under the header's
+    // command line size which this hardcoded example should not exceed.
+    // TODO(garrett): Remove nolapic, no-kvmclock, idle=poll when we can provide the proper facilities.
+    const command_line: []const u8 = "earlycon=uart8250,io,0x3F8 " ++
+        "console=ttyS0,115200 rdinit=/init " ++
+        "nolapic " ++
+        "no-kvmclock " ++
+        "idle=poll " ++
+        "initcall_blacklist=print_s5_reset_status_mmio";
+
+    const command_line_end = layout.command_line_address + command_line.len;
+    @memcpy(memory_bytes[layout.command_line_address..command_line_end], command_line);
+
+    // TODO(garrett): We can safely cast these because we've artifically limited our memory allocation for VMs
+    // down to 1GiB at max. When this changes, we'll need to be more careful here.
+    const guest_kernel_header: *align(1) KernelHeader =
+        @ptrFromInt(memory.host_physical_start + kernel_header_offset + layout.zero_page_address);
+
+    guest_kernel_header.bootloader_identifier = 0xFF;
+    guest_kernel_header.command_line_pointer = @intCast(layout.command_line_address);
+    guest_kernel_header.*.ramdisk_load_address = @intCast(layout.initramfs_address);
+    guest_kernel_header.*.ramdisk_size = @intCast(initramfs.len);
+
+    const page_table_end = configureTemporaryPageTables(memory, layout);
+    provideE820MemoryRegions(memory, layout, page_table_end);
 }
 
 pub fn launchState(layout: KernelMemoryLayout) guest_state.LaunchState {
