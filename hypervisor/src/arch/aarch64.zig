@@ -14,9 +14,9 @@ pub const Error = error{
     CannotMeetGuestSpecification,
     InvalidGuestBootData,
     MemoryRequestFailed,
-    NestedPagingNotSupported,
     NotImplemented,
     VirtualizationDisabled,
+    VirtualizationFeatureMissing,
     VirtualizationNotSupported,
 };
 
@@ -26,7 +26,7 @@ pub const GuestPreparation = guest.Preparation(GuestLaunchState);
 pub const Backend = struct {
     const Self = @This();
 
-    pub fn isNestedPagingSupported(_: Self) bool {
+    pub fn areRequiredFeaturesPresent(_: Self) bool {
         return false;
     }
 

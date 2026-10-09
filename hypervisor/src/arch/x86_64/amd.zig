@@ -25,6 +25,14 @@ const vm_host_save_address_msr = 0xC001_0117;
 
 const svm_available_features = 0x8000_000A;
 const nested_paging_bit = (1 << 0);
+const next_instruction_pointer_bit = (1 << 3);
+
+pub const VmExitCode = enum(i64) {
+    invalid_guest_state = -1,
+    cpuid = 0x72,
+    halt = 0x78,
+    nested_page_fault = 0x400,
+};
 
 const NestedPagingControl = packed struct(u64) {
     is_nested_paging_enabled: u1,
@@ -32,9 +40,11 @@ const NestedPagingControl = packed struct(u64) {
 };
 
 const InterceptBlock1 = packed struct(u32) {
-    _reserved1: u24,
+    _reserved1: u18,
+    cpuid: u1,
+    _reserved2: u5,
     hlt: u1,
-    _reserved2: u7,
+    _reserved3: u7,
 };
 
 const InterceptBlock2 = packed struct(u32) {
@@ -143,6 +153,7 @@ const VirtualMachineControlBlock = struct {
         vmsave(@intFromPtr(self.raw));
 
         self.asid().* = 1;
+        self.interceptBlock1().*.cpuid = 1;
         self.interceptBlock1().*.hlt = 1;
         self.interceptBlock2().*.vmrun = 1;
         self.efer().* = efer_override;
@@ -227,6 +238,10 @@ const VirtualMachineControlBlock = struct {
         return self.ptr(0x010, InterceptBlock2);
     }
 
+    fn next_rip(self: Self) *u64 {
+        return self.ptr(0x0C8, u64);
+    }
+
     fn rax(self: Self) *u64 {
         return self.savedStatePtr(0x1F8, u64);
     }
@@ -249,6 +264,10 @@ fn vmrunEntry() callconv(.naked) void {
     // not allow us to set general purpose registers (except RAX + RSP). In order to be able to set
     // these, we take them from the guest register configuration after pushing our host registers
     // onto the stack. Once we exit, host registers are restored so we can resume execution.
+    //
+    // TODO(garrett): Preserve the more advanced floating-point operation registers like YMM and
+    // ZMM which are only available based on feature support in the CPU as well as guest x87/XMM
+    // and XCR0 state.
     asm volatile (
         \\
         \\ subq $520, %%rsp
@@ -349,11 +368,18 @@ pub const Backend = struct {
 
     const Self = @This();
 
-    pub fn isNestedPagingSupported(self: Self) bool {
+    pub fn areRequiredFeaturesPresent(self: Self) bool {
         if (self.max_extended_func < svm_available_features) return false;
 
         const svm_features = cpuid.query(svm_available_features, 0);
-        if ((svm_features.edx & nested_paging_bit) != 0) {
+        const nested_paging = svm_features.edx & nested_paging_bit;
+        const next_rip = svm_features.edx & next_instruction_pointer_bit;
+
+        // NOTE(garrett): We can get by without either of these acceleration
+        // features. For simplicitly, we require them to avoid handling the
+        // missing case where we'd have to do heavy manual management of the
+        // guest CPU state.
+        if ((nested_paging != 0) and (next_rip != 0)) {
             return true;
         }
 
@@ -510,6 +536,46 @@ pub const Backend = struct {
         self.general_purpose_registers = launch_state.general_purpose_registers;
     }
 
+    fn interceptCpuid(vmcb: VirtualMachineControlBlock, registers: *guest_state.GeneralPurposeRegisters) void {
+        // TODO(garrett): Support nRIP-incompatible CPUs
+        vmcb.rip().* = vmcb.next_rip().*;
+
+        // NOTE(garrett): Duriel's hypervisor detection specification. RAX is the greatest value
+        // in the reserved range that's valid wihle RBX/RCX/RDX provide our hypervisor name.
+        if (registers.rax == 0x4000_0000) {
+            vmcb.rax().* = 0x4000_0000;
+            registers.rax = 0x4000_0000;
+            registers.rbx = std.mem.readInt(u32, "Duri", .little);
+            registers.rcx = std.mem.readInt(u32, "el  ", .little);
+            registers.rdx = std.mem.readInt(u32, "    ", .little);
+            return;
+        }
+
+        // NOTE(garrett): These CPUID leaves are in the reserved hypervisor range. We zero them
+        // to prevent leaking state for KVM, Xen, Hyper-V, etc.
+        if (registers.rax > 0x4000_0000 and registers.rax < 0x5000_0000) {
+            vmcb.rax().* = 0;
+            registers.rax = 0;
+            registers.rbx = 0;
+            registers.rcx = 0;
+            registers.rdx = 0;
+            return;
+        }
+
+        var cpuid_data = cpuid.query(@truncate(registers.rax), @truncate(registers.rcx));
+
+        // NOTE(garrett): Match Hyper-V's hypervisor presence detection.
+        if (registers.rax == 1) {
+            cpuid_data.ecx |= (1 << 31);
+        }
+
+        vmcb.rax().* = cpuid_data.eax;
+        registers.rax = cpuid_data.eax;
+        registers.rbx = cpuid_data.ebx;
+        registers.rcx = cpuid_data.ecx;
+        registers.rdx = cpuid_data.edx;
+    }
+
     pub fn runGuest(self: *Self) VmExit {
         const vmcb = self.vmcb orelse @panic("VMCB not prepared");
         const registers = if (self.general_purpose_registers) |*regs|
@@ -517,8 +583,17 @@ pub const Backend = struct {
         else
             @panic("Guest registers not prepared");
 
-        vmrun(@intFromPtr(vmcb.raw), registers);
-        registers.rax = vmcb.rax().*;
+        var is_final_exit = false;
+
+        while (!is_final_exit) {
+            vmrun(@intFromPtr(vmcb.raw), registers);
+            registers.rax = vmcb.rax().*;
+
+            switch (vmcb.exit_code().*) {
+                @intFromEnum(VmExitCode.cpuid) => interceptCpuid(vmcb, registers),
+                else => is_final_exit = true,
+            }
+        }
 
         return .{
             .code = vmcb.exit_code().*,

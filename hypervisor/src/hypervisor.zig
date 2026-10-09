@@ -168,12 +168,12 @@ pub fn enter(handoff_data: UefiHandoff) noreturn {
             std.log.err("Required memory could not be allocated.", .{});
             Architecture.hlt();
         },
-        error.NestedPagingNotSupported => {
-            std.log.err("Nested paging is not supported.", .{});
-            Architecture.hlt();
-        },
         error.VirtualizationDisabled => {
             std.log.err("Virtualization has been disabled, please check firmware settings.", .{});
+            Architecture.hlt();
+        },
+        error.VirtualizationFeatureMissing => {
+            std.log.err("A required virtualization feature is not present on the CPU.", .{});
             Architecture.hlt();
         },
         error.VirtualizationNotSupported => {

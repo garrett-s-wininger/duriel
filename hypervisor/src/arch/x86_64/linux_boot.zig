@@ -323,11 +323,10 @@ pub fn initializeGuestMemory(
 
     // TODO(garrett): Make this more flexible and bounds check when we do as we must be under the header's
     // command line size which this hardcoded example should not exceed.
-    // TODO(garrett): Remove nolapic, no-kvmclock, idle=poll when we can provide the proper facilities.
+    // TODO(garrett): Remove nolapic, idle=poll when we can provide the proper facilities.
     const command_line: []const u8 = "earlycon=uart8250,io,0x3F8 " ++
         "console=ttyS0,115200 rdinit=/init " ++
         "nolapic " ++
-        "no-kvmclock " ++
         "idle=poll " ++
         "initcall_blacklist=print_s5_reset_status_mmio";
 

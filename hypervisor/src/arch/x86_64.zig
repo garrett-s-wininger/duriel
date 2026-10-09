@@ -24,10 +24,10 @@ pub const Error = error{
     CannotMeetGuestSpecification,
     InvalidGuestBootData,
     MemoryRequestFailed,
-    NestedPagingNotSupported,
     NotImplemented,
     UnknownVendor,
     VirtualizationDisabled,
+    VirtualizationFeatureMissing,
     VirtualizationNotSupported,
 };
 
@@ -50,7 +50,7 @@ pub const Backend = union(enum) {
             .amd => |*backend| {
                 if (!backend.isVirtualizationSupported()) return error.VirtualizationNotSupported;
                 if (backend.isVirtualizationDisabled()) return error.VirtualizationDisabled;
-                if (!backend.isNestedPagingSupported()) return error.NestedPagingNotSupported;
+                if (!backend.areRequiredFeaturesPresent()) return error.VirtualizationFeatureMissing;
 
                 // TODO(garrett): Move from our hardcoded host save area and vm control
                 // (+ 4-level extended/nested page table) to a more dynamic setup.
@@ -97,8 +97,8 @@ pub const Backend = union(enum) {
                 const exit = backend.runGuest();
 
                 switch (exit.code) {
-                    0x78 => return .halt,
-                    0x400 => return .{
+                    @intFromEnum(amd.VmExitCode.halt) => return .halt,
+                    @intFromEnum(amd.VmExitCode.nested_page_fault) => return .{
                         .second_stage_fault = .{
                             .guest_physical_address = exit.info2,
                             .raw_status = exit.info1,
