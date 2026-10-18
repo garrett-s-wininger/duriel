@@ -6,11 +6,9 @@ const guest_state = @import("guest_state.zig");
 const inst = @import("inst.zig");
 const paging = @import("paging.zig");
 const std = @import("std");
+const xstate = @import("xstate.zig");
 
 pub const vendor_string = "AuthenticAMD";
-
-const processor_model_and_feature_ids = 0x0000_0001;
-const msr_feature_bit = (1 << 5);
 
 const extended_processor_feature_ids = 0x8000_0001;
 const svm_feature_bit = (1 << 2);
@@ -31,7 +29,24 @@ pub const VmExitCode = enum(i64) {
     invalid_guest_state = -1,
     cpuid = 0x72,
     halt = 0x78,
+    xsetbv = 0x8D,
     nested_page_fault = 0x400,
+};
+
+const EventInjectionType = enum(u3) {
+    external_or_virtual_interrupt = 0,
+    non_maskable_interrupt = 2,
+    exception = 3,
+    software_interrupt = 4,
+};
+
+const EventInjection = packed struct(u64) {
+    interrupt_vector: u8,
+    type: EventInjectionType,
+    error_code_valid: u1,
+    should_be_zero: u19 = 0,
+    valid: u1,
+    error_code: u32,
 };
 
 const NestedPagingControl = packed struct(u64) {
@@ -49,7 +64,9 @@ const InterceptBlock1 = packed struct(u32) {
 
 const InterceptBlock2 = packed struct(u32) {
     vmrun: u1,
-    _reserved: u31,
+    _reserved1: u12,
+    xsetbv: u1,
+    _reserved2: u18,
 };
 
 const Segment = packed struct(u128) {
@@ -125,6 +142,10 @@ const VirtualMachineControlBlock = struct {
         return self.savedStatePtr(0x040, Segment);
     }
 
+    fn event_injection(self: Self) *u64 {
+        return self.ptr(0x0A8, u64);
+    }
+
     fn exit_code(self: Self) *u64 {
         return self.ptr(0x070, u64);
     }
@@ -156,6 +177,7 @@ const VirtualMachineControlBlock = struct {
         self.interceptBlock1().*.cpuid = 1;
         self.interceptBlock1().*.hlt = 1;
         self.interceptBlock2().*.vmrun = 1;
+        self.interceptBlock2().*.xsetbv = 1;
         self.efer().* = efer_override;
         self.cpl().* = 0;
         self.cr0().* = inst.readCr0();
@@ -261,18 +283,11 @@ const VirtualMachineControlBlock = struct {
 
 fn vmrunEntry() callconv(.naked) void {
     // NOTE(garrett): This assumes the MSFT x64 calling conventions. The VMCB and save state area do
-    // not allow us to set general purpose registers (except RAX + RSP). In order to be able to set
-    // these, we take them from the guest register configuration after pushing our host registers
-    // onto the stack. Once we exit, host registers are restored so we can resume execution.
-    //
-    // TODO(garrett): Preserve the more advanced floating-point operation registers like YMM and
-    // ZMM which are only available based on feature support in the CPU as well as guest x87/XMM
-    // and XCR0 state.
+    // not allow us to set general purpose registers (except RAX + RSP) or extended state (AVX2,
+    // AVX-512). In order to be able to set these, we take them from the guest after pushing our host
+    // registers onto the stack. Once we exit, host registers are restored so we can resume execution.
     asm volatile (
-        \\
-        \\ subq $520, %%rsp
-        \\ fxsave64 (%%rsp)
-        \\
+        \\ # NOTE(garrett): Save the host general purpose registers
         \\ pushq %%rbx
         \\ pushq %%rbp
         \\ pushq %%rdi
@@ -282,9 +297,38 @@ fn vmrunEntry() callconv(.naked) void {
         \\ pushq %%r14
         \\ pushq %%r15
         \\
+        \\ # NOTE(garrett): Push arguments onto the stack
+        \\ pushq %%r8
         \\ pushq %%rdx
         \\ pushq %%rcx
         \\
+        \\ # NOTE(garrett): Temporarily set extended state to all preserved features
+        \\ movq 16(%%rsp), %%r8
+        \\ xorl %%ecx, %%ecx
+        \\ movl 32(%%r8), %%eax
+        \\ movl 36(%%r8), %%edx
+        \\ xsetbv
+        \\
+        \\ # NOTE(garrett): Store host extended state
+        \\ movq 16(%%rsp), %%r8
+        \\ movq 16(%%r8), %%r9
+        \\ movl 32(%%r8), %%eax
+        \\ movl 36(%%r8), %%edx
+        \\ xsave64 (%%r9)
+        \\
+        \\ # NOTE(garrett): Restore guest extended state
+        \\ movq 0(%%r8), %%r9
+        \\ movl 32(%%r8), %%eax
+        \\ movl 36(%%r8), %%edx
+        \\ xrstor64 (%%r9)
+        \\
+        \\ # NOTE(garrett): Set guest extended state features
+        \\ xorl %%ecx, %%ecx
+        \\ movl 8(%%r8), %%eax
+        \\ movl 12(%%r8), %%edx
+        \\ xsetbv
+        \\
+        \\ # NOTE(garrett): Load guest general purpose registers
         \\ movq 8(%%rsp), %%rax
         \\ movq 8(%%rax), %%rbx
         \\ movq 16(%%rax), %%rcx
@@ -304,6 +348,7 @@ fn vmrunEntry() callconv(.naked) void {
         \\
         \\ vmrun
         \\
+        \\ # NOTE(garrett): Save updated guest general purpose registers
         \\ movq 8(%%rsp), %%rax
         \\ movq %%rbx, 8(%%rax)
         \\ movq %%rcx, 16(%%rax)
@@ -320,7 +365,39 @@ fn vmrunEntry() callconv(.naked) void {
         \\ movq %%r14, 104(%%rax)
         \\ movq %%r15, 112(%%rax)
         \\
-        \\ addq $16, %%rsp
+        \\ # NOTE(garrett): Save new guest extended state features
+        \\ movq 16(%%rsp), %%r8
+        \\ xorl %%ecx, %%ecx
+        \\ xgetbv
+        \\ movl %%eax, 8(%%r8)
+        \\ movl %%edx, 12(%%r8)
+        \\
+        \\ # NOTE(garrett): Temporarily enable all extended state features
+        \\ xorl %%ecx, %%ecx
+        \\ movl 32(%%r8), %%eax
+        \\ movl 36(%%r8), %%edx
+        \\ xsetbv
+        \\
+        \\ # NOTE(garrett): Save guest extended state
+        \\ movq 0(%%r8), %%r9
+        \\ movl 32(%%r8), %%eax
+        \\ movl 36(%%r8), %%edx
+        \\ xsave64 (%%r9)
+        \\
+        \\ # NOTE(garrett): Restore host extended state
+        \\ movq 16(%%r8), %%r9
+        \\ movl 32(%%r8), %%eax
+        \\ movl 36(%%r8), %%edx
+        \\ xrstor64 (%%r9)
+        \\
+        \\ # NOTE(garrett): Restore host extended state features
+        \\ xorl %%ecx, %%ecx
+        \\ movl 24(%%r8), %%eax
+        \\ movl 28(%%r8), %%edx
+        \\ xsetbv
+        \\
+        \\ # NOTE(garrett): Clear arguments, restore host general purpose registers
+        \\ addq $24, %%rsp
         \\ popq %%r15
         \\ popq %%r14
         \\ popq %%r13
@@ -330,20 +407,22 @@ fn vmrunEntry() callconv(.naked) void {
         \\ popq %%rbp
         \\ popq %%rbx
         \\
-        \\ fxrstor64 (%%rsp)
-        \\ addq $520, %%rsp
-        \\
         \\ retq
     );
 }
 
-fn vmrun(vmcb_address: u64, registers: *guest_state.GeneralPurposeRegisters) void {
+fn vmrun(
+    vmcb_address: u64,
+    registers: *guest_state.GeneralPurposeRegisters,
+    extended_state: *xstate.ExtendedStateContext,
+) void {
     const entry: *const fn (
         u64,
         *guest_state.GeneralPurposeRegisters,
+        *xstate.ExtendedStateContext,
     ) callconv(.c) void = @ptrCast(&vmrunEntry);
 
-    entry(vmcb_address, registers);
+    entry(vmcb_address, registers, extended_state);
 }
 
 fn vmsave(save_address: u64) void {
@@ -363,12 +442,38 @@ pub const VmExit = struct {
 pub const Backend = struct {
     max_standard_func: u32,
     max_extended_func: u32,
-    vmcb: ?VirtualMachineControlBlock = null,
+    xstate_info: xstate.ExtendedStateMetadata,
+
     general_purpose_registers: ?guest_state.GeneralPurposeRegisters = null,
+    vmcb: ?VirtualMachineControlBlock = null,
+
+    // NOTE(garrett): This default leaves MMX operations enabled which is the default on CPU
+    // initialization
+    xstate_guest_area: ?u64 = null,
+    xstate_guest_xcr0: u64 = 1,
+
+    xstate_host_area: ?u64 = null,
+    xstate_host_xcr0: u64 = undefined,
 
     const Self = @This();
 
+    fn isVirtualizationSupported(self: Self) bool {
+        if (self.max_standard_func < cpuid.processor_model_and_feature_ids) return false;
+
+        const standard_feature_information = cpuid.query(cpuid.processor_model_and_feature_ids, 0);
+        const msr_enabled = (standard_feature_information.edx & cpuid.msr_feature_bit) != 0;
+
+        if (!msr_enabled) return false;
+        if (self.max_extended_func < extended_processor_feature_ids) return false;
+
+        const extended_feature_information = cpuid.query(extended_processor_feature_ids, 0);
+        const svm_enabled = (extended_feature_information.ecx & svm_feature_bit) != 0;
+
+        return svm_enabled;
+    }
+
     pub fn areRequiredFeaturesPresent(self: Self) bool {
+        if (!self.isVirtualizationSupported()) return false;
         if (self.max_extended_func < svm_available_features) return false;
 
         const svm_features = cpuid.query(svm_available_features, 0);
@@ -389,21 +494,6 @@ pub const Backend = struct {
     pub fn isVirtualizationDisabled(_: Self) bool {
         const vm_cr = inst.rdmsr(vm_cr_msr);
         return (vm_cr & svm_disabled_bit) != 0;
-    }
-
-    pub fn isVirtualizationSupported(self: Self) bool {
-        if (self.max_standard_func < processor_model_and_feature_ids) return false;
-
-        const standard_feature_information = cpuid.query(processor_model_and_feature_ids, 0);
-        const msr_enabled = (standard_feature_information.edx & msr_feature_bit) != 0;
-
-        if (!msr_enabled) return false;
-        if (self.max_extended_func < extended_processor_feature_ids) return false;
-
-        const extended_feature_information = cpuid.query(extended_processor_feature_ids, 0);
-        const svm_enabled = (extended_feature_information.ecx & svm_feature_bit) != 0;
-
-        return svm_enabled;
     }
 
     fn prepareNestedPageTables(pml4_start: u64, instance: guest.Memory) u64 {
@@ -536,13 +626,20 @@ pub const Backend = struct {
         self.general_purpose_registers = launch_state.general_purpose_registers;
     }
 
-    fn interceptCpuid(vmcb: VirtualMachineControlBlock, registers: *guest_state.GeneralPurposeRegisters) void {
+    fn interceptCpuid(
+        vmcb: VirtualMachineControlBlock,
+        registers: *guest_state.GeneralPurposeRegisters,
+        extended_state: xstate.ExtendedStateContext,
+    ) void {
+        const leaf: u32 = @truncate(registers.rax);
+        const subleaf: u32 = @truncate(registers.rcx);
+
         // TODO(garrett): Support nRIP-incompatible CPUs
         vmcb.rip().* = vmcb.next_rip().*;
 
         // NOTE(garrett): Duriel's hypervisor detection specification. RAX is the greatest value
         // in the reserved range that's valid wihle RBX/RCX/RDX provide our hypervisor name.
-        if (registers.rax == 0x4000_0000) {
+        if (leaf == 0x4000_0000) {
             vmcb.rax().* = 0x4000_0000;
             registers.rax = 0x4000_0000;
             registers.rbx = std.mem.readInt(u32, "Duri", .little);
@@ -553,7 +650,7 @@ pub const Backend = struct {
 
         // NOTE(garrett): These CPUID leaves are in the reserved hypervisor range. We zero them
         // to prevent leaking state for KVM, Xen, Hyper-V, etc.
-        if (registers.rax > 0x4000_0000 and registers.rax < 0x5000_0000) {
+        if (leaf > 0x4000_0000 and leaf < 0x5000_0000) {
             vmcb.rax().* = 0;
             registers.rax = 0;
             registers.rbx = 0;
@@ -562,11 +659,59 @@ pub const Backend = struct {
             return;
         }
 
-        var cpuid_data = cpuid.query(@truncate(registers.rax), @truncate(registers.rcx));
+        var cpuid_data = cpuid.query(leaf, subleaf);
 
-        // NOTE(garrett): Match Hyper-V's hypervisor presence detection.
-        if (registers.rax == 1) {
+        // NOTE(garrett): Match Hyper-V's hypervisor presence detection and virtualize OSXSAVE
+        // support answers.
+        if (leaf == 1) {
+            cpuid_data.ecx &= ~@as(u32, cpuid.osxsave_bit);
+
+            if ((vmcb.cr4().* & @as(u64, xstate.osxsave_cr4_bit)) != 0) {
+                cpuid_data.ecx |= @as(u32, cpuid.osxsave_bit);
+            }
+
             cpuid_data.ecx |= (1 << 31);
+        }
+
+        // NOTE(garrett): Disable support for Control-Flow Enforcement Technology (CET) Shadow Stacks
+        // TODO(garrett): Remove/adjust when we implement shadow stack support.
+        if (leaf == cpuid.extended_feature_ids and subleaf == 0) {
+            const shadow_stack_support_bit = @as(u32, 1) << 7;
+            cpuid_data.ecx &= ~shadow_stack_support_bit;
+        }
+
+        // NOTE(garrett): Special handling for our extended state.
+        if (leaf == xstate.extended_state_enumeration_leaf) {
+            if (subleaf == 0) {
+                cpuid_data.ebx = @intCast(xstate.layoutSize(extended_state.guest_xcr0, false));
+            } else if (subleaf == 1) {
+                // NOTE(garrett): Disable XSS save support.
+                // TODO(garrett): Revisit when supervisor extended state is supported.
+                cpuid_data.eax &= ~@as(u32, xstate.xsave_supervisor_support_bit);
+                cpuid_data.ebx = @intCast(xstate.layoutSize(extended_state.guest_xcr0, true));
+
+                // NOTE(garrett): Disable all XSS (Extended State Supervisor) MSR-dependent features.
+                // TODO(garrett): Revisit when supervisor extended state is supported.
+                cpuid_data.ecx = 0;
+                cpuid_data.edx = 0;
+            } else if (subleaf >= 2 and subleaf <= 62) {
+                const supported: u64 = @bitCast(extended_state.preservation_mask);
+                const present = supported & (@as(u64, 1) << @intCast(subleaf)) != 0;
+
+                if (!present) {
+                    // NOTE(garrett): If our feature isn't supported, clear the response.
+                    cpuid_data.eax = 0;
+                    cpuid_data.ebx = 0;
+                    cpuid_data.ecx = 0;
+                    cpuid_data.edx = 0;
+                }
+            } else if (subleaf > 62) {
+                // NOTE(garrett): These subleafs are reserved and should return zeros.
+                cpuid_data.eax = 0;
+                cpuid_data.ebx = 0;
+                cpuid_data.ecx = 0;
+                cpuid_data.edx = 0;
+            }
         }
 
         vmcb.rax().* = cpuid_data.eax;
@@ -576,6 +721,55 @@ pub const Backend = struct {
         registers.rdx = cpuid_data.edx;
     }
 
+    fn interceptXSetBv(
+        vmcb: VirtualMachineControlBlock,
+        registers: *guest_state.GeneralPurposeRegisters,
+        extended_state: *xstate.ExtendedStateContext,
+    ) void {
+        const xcr0_low: u32 = @truncate(registers.rax);
+        const xcr0_high: u32 = @truncate(registers.rdx);
+        const xcr0: u64 = (@as(u64, xcr0_high) << 32) | xcr0_low;
+        const feature_mask: xstate.FeatureMask = @bitCast(xcr0);
+        const supported: u64 = @bitCast(extended_state.preservation_mask);
+
+        virtualize: {
+            if ((xcr0 & ~supported) != 0) break :virtualize;
+
+            const xcr_index: u32 = @truncate(registers.rcx);
+            if (xcr_index != 0) break :virtualize;
+            if (feature_mask.x87 != 1) break :virtualize;
+
+            const sse_enabled = feature_mask.sse == 1;
+            const avx_enabled = feature_mask.ymm == 1;
+            if (avx_enabled and !sse_enabled) break :virtualize;
+
+            if (feature_mask.k != feature_mask.zmm_0_15 or feature_mask.k != feature_mask.zmm_16_31) {
+                break :virtualize;
+            }
+
+            const avx512_requested = feature_mask.k == 1 or
+                feature_mask.zmm_0_15 == 1 or
+                feature_mask.zmm_16_31 == 1;
+
+            if (avx512_requested and (!sse_enabled or !avx_enabled)) break :virtualize;
+            if (vmcb.cpl().* != 0) break :virtualize;
+
+            extended_state.guest_xcr0 = xcr0;
+            vmcb.rip().* = vmcb.next_rip().*;
+            return;
+        }
+
+        const event = EventInjection{
+            .interrupt_vector = 13,
+            .type = .exception,
+            .error_code_valid = 1,
+            .valid = 1,
+            .error_code = 0,
+        };
+
+        vmcb.event_injection().* = @bitCast(event);
+    }
+
     pub fn runGuest(self: *Self) VmExit {
         const vmcb = self.vmcb orelse @panic("VMCB not prepared");
         const registers = if (self.general_purpose_registers) |*regs|
@@ -583,14 +777,26 @@ pub const Backend = struct {
         else
             @panic("Guest registers not prepared");
 
+        var extended_state = xstate.ExtendedStateContext{
+            .guest_save_state_address = self.xstate_guest_area orelse @panic("Guest XState Uninitialized"),
+            .guest_xcr0 = self.xstate_guest_xcr0,
+            .preservation_mask = self.xstate_info.supported_mask,
+            .host_save_state_address = self.xstate_host_area orelse @panic("Host XState Uninitialized"),
+            .host_xcr0 = self.xstate_host_xcr0,
+        };
+
         var is_final_exit = false;
 
         while (!is_final_exit) {
-            vmrun(@intFromPtr(vmcb.raw), registers);
+            vmrun(@intFromPtr(vmcb.raw), registers, &extended_state);
             registers.rax = vmcb.rax().*;
 
             switch (vmcb.exit_code().*) {
-                @intFromEnum(VmExitCode.cpuid) => interceptCpuid(vmcb, registers),
+                @intFromEnum(VmExitCode.cpuid) => interceptCpuid(vmcb, registers, extended_state),
+                @intFromEnum(VmExitCode.xsetbv) => {
+                    interceptXSetBv(vmcb, registers, &extended_state);
+                    self.xstate_guest_xcr0 = extended_state.guest_xcr0;
+                },
                 else => is_final_exit = true,
             }
         }

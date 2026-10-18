@@ -189,6 +189,14 @@ pub fn writeCr3(value: u64) void {
         : .{ .memory = true });
 }
 
+pub fn writeCr4(value: u64) void {
+    asm volatile (
+        \\movq %[value], %%cr4
+        :
+        : [value] "r" (value),
+    );
+}
+
 pub fn wrmsr(register: u32, value: u64) void {
     const low_order: u32 = @truncate(value);
     const high_order: u32 = @truncate(value >> 32);

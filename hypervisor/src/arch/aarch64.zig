@@ -15,9 +15,9 @@ pub const Error = error{
     InvalidGuestBootData,
     MemoryRequestFailed,
     NotImplemented,
+    RequiredFeatureMissing,
+    UnknownVendor,
     VirtualizationDisabled,
-    VirtualizationFeatureMissing,
-    VirtualizationNotSupported,
 };
 
 pub const GuestLaunchState = struct {};

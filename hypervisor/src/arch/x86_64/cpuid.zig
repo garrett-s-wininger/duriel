@@ -1,11 +1,13 @@
 const std = @import("std");
 
-const Result = struct {
-    eax: u32,
-    ebx: u32,
-    ecx: u32,
-    edx: u32
-};
+pub const processor_model_and_feature_ids = 0x0000_0001;
+pub const msr_feature_bit = (1 << 5);
+pub const extended_state_feature_bit = (1 << 26);
+pub const osxsave_bit = (1 << 27);
+
+pub const extended_feature_ids = 0x0000_0007;
+
+const Result = struct { eax: u32, ebx: u32, ecx: u32, edx: u32 };
 
 const MaxStandardFuncAndVendor = struct {
     max_standard_func: u32,
@@ -18,10 +20,14 @@ pub fn query(leaf: u32, subleaf: u32) Result {
     var ecx: u32 = undefined;
     var edx: u32 = undefined;
 
-    asm volatile(
+    asm volatile (
         \\cpuid
-        : [_] "={eax}" (eax), [_] "={ebx}" (ebx), [_] "={ecx}" (ecx), [_] "={edx}" (edx),
-        : [leaf] "{eax}" (leaf), [subleaf] "{ecx}" (subleaf)
+        : [_] "={eax}" (eax),
+          [_] "={ebx}" (ebx),
+          [_] "={ecx}" (ecx),
+          [_] "={edx}" (edx),
+        : [leaf] "{eax}" (leaf),
+          [subleaf] "{ecx}" (subleaf),
     );
 
     return .{

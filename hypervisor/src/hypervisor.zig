@@ -104,9 +104,19 @@ fn panic(fault_info: Architecture.FaultInfo) noreturn {
 }
 
 pub fn enter(handoff_data: UefiHandoff) noreturn {
-    var cpu = Architecture.detect() catch {
-        std.log.err("Unsupported processor vendor detected.", .{});
-        Architecture.hlt();
+    var cpu = Architecture.detect() catch |err| switch (err) {
+        error.RequiredFeatureMissing => {
+            std.log.err("A required feature is not present on the CPU.", .{});
+            Architecture.hlt();
+        },
+        error.UnknownVendor => {
+            std.log.err("Unsupported processor vendor detected.", .{});
+            Architecture.hlt();
+        },
+        else => {
+            std.log.err("An unkown error has occurred.", .{});
+            Architecture.hlt();
+        }
     };
 
     var bootstrap_allocator = BootstrapAllocator.init(handoff_data.memory_map) catch {
@@ -172,12 +182,8 @@ pub fn enter(handoff_data: UefiHandoff) noreturn {
             std.log.err("Virtualization has been disabled, please check firmware settings.", .{});
             Architecture.hlt();
         },
-        error.VirtualizationFeatureMissing => {
-            std.log.err("A required virtualization feature is not present on the CPU.", .{});
-            Architecture.hlt();
-        },
-        error.VirtualizationNotSupported => {
-            std.log.err("Processor does not support virtualization.", .{});
+        error.RequiredFeatureMissing => {
+            std.log.err("A required feature is not present on the CPU.", .{});
             Architecture.hlt();
         },
         else => {

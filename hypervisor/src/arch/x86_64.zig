@@ -14,6 +14,7 @@ const raw = @import("x86_64/raw_boot.zig");
 const std = @import("std");
 const x64_linux = @import("x86_64/linux_boot.zig");
 const x64_uart = @import("x86_64/uart.zig");
+const xstate = @import("x86_64/xstate.zig");
 
 pub const ConsoleUart = uart.Ns16550(x64_uart.PortMapped);
 
@@ -25,10 +26,9 @@ pub const Error = error{
     InvalidGuestBootData,
     MemoryRequestFailed,
     NotImplemented,
+    RequiredFeatureMissing,
     UnknownVendor,
     VirtualizationDisabled,
-    VirtualizationFeatureMissing,
-    VirtualizationNotSupported,
 };
 
 pub const FaultInfo = idt.FaultInfo;
@@ -41,6 +41,19 @@ pub const Backend = union(enum) {
 
     const Self = @This();
 
+    fn prepareExtendedState(xstate_area_start: u64, xstate_allocated_bytes: usize) void {
+        const xstate_areas = @as([*]u8, @ptrFromInt(xstate_area_start));
+        @memset(xstate_areas[0..(xstate_allocated_bytes * 2)], 0);
+
+        const guest_mxcsr: *xstate.MediaExtensionControlAndStatus = @ptrFromInt(xstate_area_start +
+            xstate_allocated_bytes +
+            xstate.media_extension_control_and_status_offset);
+
+        guest_mxcsr.* = .{};
+
+        inst.writeCr4(inst.readCr4() | @as(u64, xstate.osxsave_cr4_bit));
+    }
+
     pub fn prepareVirtualization(
         self: *Self,
         allocator: alloc.PageAllocator,
@@ -48,9 +61,20 @@ pub const Backend = union(enum) {
     ) Error!void {
         return switch (self.*) {
             .amd => |*backend| {
-                if (!backend.isVirtualizationSupported()) return error.VirtualizationNotSupported;
+                if (!backend.areRequiredFeaturesPresent()) return error.RequiredFeatureMissing;
                 if (backend.isVirtualizationDisabled()) return error.VirtualizationDisabled;
-                if (!backend.areRequiredFeaturesPresent()) return error.VirtualizationFeatureMissing;
+
+                // TODO(garrett): Be more efficient for enabled extended features, rather than
+                // supported ones.
+                const pages_per_xsave_state = std.math.divCeil(
+                    usize,
+                    backend.xstate_info.required_save_area_size,
+                    alloc.page_size,
+                ) catch unreachable;
+
+                // NOTE(garrett): 1 save area is for our host while we additionally need 1 for
+                // the guest.
+                const required_xstate_pages = 2 * pages_per_xsave_state;
 
                 // TODO(garrett): Move from our hardcoded host save area and vm control
                 // (+ 4-level extended/nested page table) to a more dynamic setup.
@@ -64,11 +88,21 @@ pub const Backend = union(enum) {
                     512,
                 ) catch unreachable;
 
-                const allocation_start_address = allocator.allocatePages(
-                    required_amdv_pages + required_table_pages + required_page_table_pages,
-                ) catch {
+                const required_pages = required_amdv_pages +
+                    required_table_pages +
+                    required_page_table_pages +
+                    required_xstate_pages;
+
+                const allocation_start_address = allocator.allocatePages(required_pages) catch {
                     return error.MemoryRequestFailed;
                 };
+
+                const allocation_end_address = allocation_start_address + (alloc.page_size * required_pages);
+                const xstate_allocated_bytes = pages_per_xsave_state * alloc.page_size;
+                backend.xstate_guest_area = allocation_end_address - xstate_allocated_bytes;
+                backend.xstate_host_area = backend.xstate_guest_area.? - xstate_allocated_bytes;
+                prepareExtendedState(backend.xstate_host_area.?, xstate_allocated_bytes);
+                backend.xstate_host_xcr0 = xstate.xgetbv();
 
                 backend.prepareVirtualization(
                     allocation_start_address,
@@ -120,12 +154,28 @@ pub const Backend = union(enum) {
 pub fn detect() Error!Backend {
     const basic_info = cpuid.max_standard_func_and_vendor();
 
+    if (basic_info.max_standard_func < cpuid.processor_model_and_feature_ids) {
+        return error.RequiredFeatureMissing;
+    }
+
+    const features = cpuid.query(cpuid.processor_model_and_feature_ids, 0);
+
+    if ((features.ecx & cpuid.extended_state_feature_bit) == 0) {
+        return error.RequiredFeatureMissing;
+    }
+
+    if (basic_info.max_standard_func < xstate.extended_state_enumeration_leaf) {
+        return error.RequiredFeatureMissing;
+    }
+
+    const xstate_info = xstate.detect();
+
     if (std.mem.eql(u8, basic_info.vendor[0..12], amd.vendor_string)) {
         return .{
             .amd = .{
                 .max_extended_func = cpuid.max_extended_func(),
                 .max_standard_func = basic_info.max_standard_func,
-                .vmcb = null,
+                .xstate_info = xstate_info,
             },
         };
     } else {
